@@ -1,0 +1,13 @@
+---
+deployment:
+  tasks:
+    # Copy all files to home directory app
+    - /bin/cp -R * $HOME/b1pay_backend/ 2>/dev/null || true
+    # Install dependencies if requirements changed
+    - /bin/bash -c "source $HOME/virtualenv/b1pay_backend/3.13/bin/activate && pip install -r $HOME/b1pay_backend/requirements.txt --quiet"
+    # Run migrations
+    - /bin/bash -c "source $HOME/virtualenv/b1pay_backend/3.13/bin/activate && cd $HOME/b1pay_backend && python manage.py migrate --noinput"
+    # Collect static files
+    - /bin/bash -c "source $HOME/virtualenv/b1pay_backend/3.13/bin/activate && cd $HOME/b1pay_backend && python manage.py collectstatic --noinput"
+    # Restart the application
+    - mkdir -p $HOME/b1pay_backend/tmp && touch $HOME/b1pay_backend/tmp/restart.txt
