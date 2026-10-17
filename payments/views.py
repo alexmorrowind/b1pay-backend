@@ -1,0 +1,2784 @@
+import base64
+from io import BytesIO
+import os
+import time
+import uuid
+from datetime import date, timedelta
+from decimal import Decimal
+from urllib.parse import quote_plus, urlencode, urlsplit, urlunsplit
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework import status
+from django.contrib.auth.models import User
+from django.contrib.auth.hashers import make_password
+from django.http import HttpResponseRedirect
+from django.utils import timezone
+from django.db.models import Q
+from django.urls import reverse
+import qrcode
+from .integrations import (
+    create_myid_sdk_session,
+    effective_config_value,
+    exchange_myid_sdk_code,
+    generate_sms_code,
+    get_config,
+    get_myid_status,
+    get_myid_sdk_session_status,
+    get_myid_user_profile,
+    mask_phone,
+    myid_is_configured,
+    myid_redirect_is_configured,
+    myid_sdk_is_configured,
+    myid_authorization_url,
+    exchange_myid_authorization_code,
+    payme_subscribe_rpc,
+    send_registration_sms,
+    start_myid_authentication,
+    octo_p2p_status,
+    submit_octo_p2p_transfer,
+)
+from .models import APIConfiguration, AuthSession, Bank, Card, Investment, KYCVerification, LegalEntityProfile, NewsArticle, Order, P2PTransfer, PaymeTransaction, Startup, UserProfile
+
+from .serializers import (
+    BankSerializer,
+    InvestmentSerializer,
+    LegalEntityProfileSerializer,
+    NewsArticleSerializer,
+    OrderSerializer,
+    P2PTransferCreateSerializer,
+    P2PTransferSerializer,
+    RegisterSerializer,
+    StartupPublicSerializer,
+    StartupSerializer,
+    mask_card_or_phone,
+    recipient_type_for,
+)
+
+PAYME_ERRORS = {
+    "AUTH_ERROR": {
+        "code": -32504,
+        "message": {"ru": "Ошибка авторизации", "uz": "Avtorizatsiya xatosi", "en": "Authorization error"},
+    },
+    "INVALID_REQUEST": {
+        "code": -32600,
+        "message": {"ru": "Неверный запрос", "uz": "Noto'g'ri so'rov", "en": "Invalid request"},
+    },
+    "ORDER_NOT_FOUND": {
+        "code": -31050,
+        "message": {"ru": "Заказ не найден", "uz": "Buyurtma topilmadi", "en": "Order not found"},
+        "data": "Bpay",
+    },
+    "ORDER_BUSY": {
+        "code": -31099,
+        "message": {
+            "ru": "Другая транзакция уже заняла этот заказ",
+            "uz": "Boshqa tranzaksiya bu buyurtmani band qilgan",
+            "en": "Another transaction is already processing this order",
+        },
+        "data": "Bpay",
+    },
+    "INVALID_AMOUNT": {
+        "code": -31001,
+        "message": {"ru": "Неверная сумма заказа", "uz": "Buyurtma summasi noto'g'ri", "en": "Invalid order amount"},
+        "data": "amount",
+    },
+    "CANT_CANCEL": {
+        "code": -31007,
+        "message": {"ru": "Невозможно выполнить операцию", "uz": "Operatsiyani bajarib bo'lmaydi", "en": "Operation cannot be performed"},
+    },
+    "CANT_PERFORM": {
+        "code": -31008,
+        "message": {"ru": "Невозможно выполнить операцию", "uz": "Operatsiyani bajarib bo'lmaydi", "en": "Operation cannot be performed"},
+    },
+    "TRANSACTION_NOT_FOUND": {
+        "code": -31003,
+        "message": {"ru": "Транзакция не найдена", "uz": "Tranzaksiya topilmadi", "en": "Transaction not found"},
+    },
+}
+
+PAYME_TRANSACTION_TIMEOUT_MS = 12 * 60 * 60 * 1000
+PAYME_SANDBOX_ALIAS_TARGET_ID = 'payme-sandbox-alias'
+PAYME_SANDBOX_DEFAULT_AMOUNT_UZS = Decimal('1000.00')
+
+PLACEHOLDER_PREFIXES = ('your_', 'paste_', 'change-me', 'сюда_', 'example')
+SECRET_CONFIG_KEYS = {
+    'PAYME_MERCHANT_KEY',
+    'PAYME_PREVIOUS_MERCHANT_KEY',
+    'PAYME_SUBSCRIBE_KEY',
+    'MYID_PASSWORD',
+    'MYID_CLIENT_SECRET',
+    'SMS_PROVIDER_TOKEN',
+    'DJANGO_SECRET_KEY',
+    'OCTO_SECRET_KEY',
+}
+PAYME_CHECKOUT_REQUIRED_KEYS = [
+    'PAYME_MERCHANT_ID',
+    'PAYME_MERCHANT_KEY',
+    'PAYME_CHECKOUT_URL',
+    'PAYME_CALLBACK_URL',
+    'PAYME_ACCOUNT_KEY',
+]
+CONFIG_ALIASES = {
+    'PAYME_SUBSCRIBE_ID': 'PAYME_MERCHANT_ID',
+    'PAYME_SUBSCRIBE_KEY': 'PAYME_MERCHANT_KEY',
+}
+CONFIG_DEFAULTS = {
+    'PAYME_CHECKOUT_URL': 'https://checkout.paycom.uz',
+    'PAYME_SUBSCRIBE_BASE_URL': 'https://checkout.paycom.uz/api',
+    'PAYME_ACCOUNT_KEY': 'Bpay',
+    'OCTO_API_BASE_URL': 'https://secure.octo.uz',
+    'OCTO_P2P_ENABLED': 'false',
+}
+PAYME_MIN_ORDER_AMOUNT_UZS = Decimal('1000')
+PAYME_MAX_ORDER_AMOUNT_UZS = Decimal('10000000')
+WEB_LOGIN_SESSION_TTL_SECONDS = 10 * 60
+MYID_LOGIN_SESSION_TTL_SECONDS = 15 * 60
+MYID_WEB_SESSION_TTL_SECONDS = 15 * 60
+MYID_WEB_SCOPE = 'common_data,contacts'
+
+
+def _session_qr_payload(session_id):
+    return f"bpay://auth/qr?session_id={session_id}"
+
+
+def _qr_data_url(payload):
+    qr = qrcode.QRCode(border=2, box_size=8)
+    qr.add_data(payload)
+    qr.make(fit=True)
+    image = qr.make_image(fill_color='black', back_color='white')
+    buffer = BytesIO()
+    image.save(buffer, format='PNG')
+    encoded = base64.b64encode(buffer.getvalue()).decode('ascii')
+    return f"data:image/png;base64,{encoded}"
+
+
+def _issue_tokens(user):
+    from rest_framework_simplejwt.tokens import RefreshToken
+
+    refresh = RefreshToken.for_user(user)
+    return {
+        'access': str(refresh.access_token),
+        'refresh': str(refresh),
+    }
+
+
+def _normalize_account_type(value):
+    value = str(value or '').strip().lower()
+    if value in ['legal', 'business', 'company']:
+        return 'legal'
+    return 'physical'
+
+
+def _user_identity_lookup(phone='', email=''):
+    phone = str(phone or '').strip()
+    email = str(email or '').strip().lower()
+    profile = None
+    if phone:
+        profile = UserProfile.objects.filter(phone=phone).select_related('user').first()
+        if profile:
+            return profile.user
+    if email:
+        user = User.objects.filter(username=email).first() or User.objects.filter(email=email).first()
+        if user:
+            return user
+    if phone:
+        user = User.objects.filter(username=phone).first()
+        if user:
+            return user
+    return None
+
+
+def _get_or_create_myid_user(
+    *,
+    phone='',
+    email='',
+    first_name='',
+    last_name='',
+    password_hash='',
+):
+    user = _user_identity_lookup(phone=phone, email=email)
+    if user is None:
+        username = email or phone or f'myid_{uuid.uuid4().hex[:12]}'
+        user = User(
+            username=username,
+            email=email or username,
+            first_name=first_name or '',
+            last_name=last_name or '',
+        )
+        # Registration stores only a Django password hash in the short-lived
+        # auth session.  The raw password never reaches MyID or is persisted.
+        if password_hash:
+            user.password = password_hash
+        else:
+            user.set_unusable_password()
+        user.save()
+    else:
+        changed = False
+        if email and user.email != email:
+            user.email = email
+            changed = True
+        if first_name and user.first_name != first_name:
+            user.first_name = first_name
+            changed = True
+        if last_name and user.last_name != last_name:
+            user.last_name = last_name
+            changed = True
+        if password_hash and not user.has_usable_password():
+            user.password = password_hash
+            changed = True
+        if changed:
+            user.save(update_fields=['email', 'first_name', 'last_name', 'password'])
+
+    profile, _ = UserProfile.objects.get_or_create(user=user)
+    if phone and profile.phone != phone:
+        profile.phone = phone
+    profile.myid_status = 'verified'
+    profile.save()
+    return user, profile
+
+
+def _auth_session_payload(session):
+    payload = {
+        'session_id': session.session_id,
+        'kind': session.kind,
+        'status': session.status,
+        'expires_at': session.expires_at.isoformat(),
+        'qr_payload': session.qr_payload,
+        'phone': session.phone,
+        'email': session.email,
+        'account_type': session.account_type,
+        'verified_at': session.verified_at.isoformat() if session.verified_at else '',
+        'last_error': session.last_error,
+    }
+    if session.user_id:
+        profile_phone = ''
+        try:
+            profile_phone = session.user.profile.phone or ''
+        except Exception:
+            profile_phone = ''
+        payload['user'] = {
+            'id': session.user_id,
+            'email': session.user.email,
+            'phone': profile_phone,
+            'first_name': session.user.first_name,
+            'last_name': session.user.last_name,
+        }
+    return payload
+
+
+def _create_auth_session(*, kind, phone='', email='', account_type='physical', expires_in_seconds=WEB_LOGIN_SESSION_TTL_SECONDS):
+    session_id = f"{kind}-{uuid.uuid4().hex}"
+    now = timezone.now()
+    payload = _session_qr_payload(session_id)
+    session = AuthSession.objects.create(
+        session_id=session_id,
+        kind=kind,
+        status='pending',
+        phone=phone,
+        email=email,
+        account_type=_normalize_account_type(account_type),
+        qr_payload=payload,
+        expires_at=now + timedelta(seconds=expires_in_seconds),
+    )
+    return session
+
+
+def _ensure_auth_session_active(session):
+    if session.status == 'verified':
+        return session
+    if session.expires_at and session.expires_at <= timezone.now():
+        if session.status != 'expired':
+            session.status = 'expired'
+            session.save(update_fields=['status', 'updated_at'])
+    return session
+
+
+def _frontend_login_url():
+    """Resolve the public login page without exposing backend credentials."""
+    configured = os.environ.get('FRONTEND_PUBLIC_URL', 'https://b1pay.uz/index.html').strip()
+    if not configured:
+        configured = 'https://b1pay.uz/index.html'
+    parts = urlsplit(configured)
+    path = parts.path or '/'
+    if path.endswith('/'):
+        path = f'{path}login.html'
+    elif path.rsplit('/', 1)[-1].lower() in {'index.html', 'landing.html'}:
+        path = f'{path.rsplit("/", 1)[0]}/login.html'
+    else:
+        path = f'{path.rstrip("/")}/login.html'
+    return urlunsplit((parts.scheme or 'https', parts.netloc, path, '', ''))
+
+
+def _myid_redirect_uri(request):
+    configured = (get_config('MYID_REDIRECT_URI') or '').strip()
+    if configured:
+        return configured
+    return request.build_absolute_uri(reverse('auth_myid_redirect_callback'))
+
+
+def _redirect_result_url(*, session_id='', status_value='failed', reason_code='', message=''):
+    params = {'myid_status': status_value}
+    if session_id:
+        params['myid_session'] = session_id
+    if reason_code:
+        params['reason_code'] = str(reason_code)
+    if message:
+        params['message'] = message
+    return f'{_frontend_login_url()}?{urlencode(params)}'
+
+
+def _myid_profile_values(profile_payload):
+    """Extract only the fields needed to create/update a B1 profile."""
+    profile = profile_payload.get('profile') if isinstance(profile_payload, dict) else {}
+    profile = profile if isinstance(profile, dict) else {}
+    common = profile.get('common_data') if isinstance(profile.get('common_data'), dict) else {}
+    contacts = profile.get('contacts') if isinstance(profile.get('contacts'), dict) else {}
+    documents = profile.get('doc_data') if isinstance(profile.get('doc_data'), dict) else {}
+    return {
+        'first_name': str(common.get('first_name') or '').strip(),
+        'last_name': str(common.get('last_name') or '').strip(),
+        'middle_name': str(common.get('middle_name') or '').strip(),
+        'pinfl': str(common.get('pinfl') or '').strip(),
+        'birth_date': str(common.get('birth_date') or '').strip(),
+        'phone': str(contacts.get('phone') or '').strip(),
+        'email': str(contacts.get('email') or '').strip().lower(),
+        'passport': str(documents.get('pass_data') or '').strip().upper(),
+        'authentication_method': str(profile.get('authentication_method') or '').strip(),
+    }
+
+CBU_BANKS_SOURCE = 'https://cbu.uz/en/credit-organizations/banks/head-offices/'
+CATALOG_DATA_DATE = date(2026, 8, 24)
+
+
+def catalog_bank(
+    name,
+    abbr,
+    slug,
+    ownership_type,
+    license_number,
+    license_date,
+    website,
+    address,
+    description,
+    description_uz,
+    products,
+    services,
+    recommended=False,
+    legal_name=None,
+    latitude=None,
+    longitude=None,
+):
+    return {
+        'name': name,
+        'abbr': abbr,
+        'logo_url': '',
+        'apy': 0,
+        'min_deposit': Decimal('0.00'),
+        'rating': 0,
+        'is_recommended': recommended,
+        'is_catalog': True,
+        'slug': slug,
+        'legal_name': legal_name or name,
+        'description': description,
+        'description_uz': description_uz,
+        'ownership_type': ownership_type,
+        'license_number': license_number,
+        'license_date': date.fromisoformat(license_date),
+        'website_url': website,
+        'address': address,
+        'products': products,
+        'services': services,
+        'source_urls': [CBU_BANKS_SOURCE, website],
+        'data_as_of': CATALOG_DATA_DATE,
+        'latitude': latitude,
+        'longitude': longitude,
+    }
+
+
+DEFAULT_BANKS = [
+    catalog_bank(
+        'National Bank of Uzbekistan', 'NBU', 'nbu', 'state', '22', '1991-10-24',
+        'https://nbu.uz/',
+        '100084, Tashkent, Yunusabad district, Amir Temur Ave., 101',
+        'Крупный государственный банк для физических лиц, бизнеса и корпоративных клиентов.',
+        "Jismoniy shaxslar, biznes va korporativ mijozlar uchun yirik davlat banki.",
+        ['Кредиты', 'Депозиты', 'Карты', 'Переводы'],
+        ['Мобильный банкинг', 'Обмен валюты', 'Для бизнеса'],
+        True,
+        'National Bank for Foreign Economic Activity of the Republic of Uzbekistan',
+        latitude=41.3357749,
+        longitude=69.2835369,
+    ),
+    catalog_bank(
+        'Agrobank', 'AGB', 'agrobank', 'state', '78', '2009-04-30',
+        'https://agrobank.uz/',
+        '100011, Tashkent, Shaxontohur district, Botir Zokirov str., 2A',
+        'Государственный банк с широкой сетью отделений и продуктами для граждан, бизнеса и агросектора.',
+        "Jismoniy shaxslar, biznes va agrosoha uchun keng tarmoqqa ega davlat banki.",
+        ['Кредиты', 'Депозиты', 'Карты', 'Микрозаймы'],
+        ['Agrobank Mobile', 'Переводы', 'Для бизнеса'],
+        True,
+        'Joint-Stock Commercial Bank "Agrobank"',
+        latitude=41.2936116,
+        longitude=69.2193691,
+    ),
+    catalog_bank(
+        'Uzpromstroybank (SQB)', 'SQB', 'sqb', 'state', '17', '1991-06-24',
+        'https://sqb.uz/',
+        '100000, Tashkent, Yunusabad district, Shakhrisabzskaya str., 3',
+        'Государственный банк с сильным присутствием в финансировании промышленности и строительства.',
+        "Sanoat va qurilish loyihalarini moliyalashtirishda faol davlat banki.",
+        ['Кредиты', 'Депозиты', 'Карты', 'Ипотека'],
+        ['Интернет-банкинг', 'Для бизнеса', 'Международные расчёты'],
+        legal_name='Joint-Stock Commercial Bank "Uzpromstroybank"',
+        latitude=41.2901623,
+        longitude=69.2847284,
+    ),
+    catalog_bank(
+        'Asakabank', 'ASK', 'asakabank', 'state', '53', '1996-01-19',
+        'https://asakabank.uz/',
+        '100027, Tashkent city, Shaykhantakhur district, Yangi Tashkent str., 1',
+        'Государственный коммерческий банк с продуктами для граждан, автокредитования и корпоративного сектора.',
+        "Jismoniy shaxslar, avtokreditlash va korporativ sektor uchun xizmatlar.",
+        ['Кредиты', 'Депозиты', 'Карты', 'Автокредиты'],
+        ['Мобильный банкинг', 'Переводы', 'Для бизнеса'],
+        True,
+        'Joint-Stock Company "Asakabank"',
+        latitude=41.2967724,
+        longitude=69.2650479,
+    ),
+    catalog_bank(
+        'Xalq Bank', 'XALQ', 'xalq-bank', 'state', '25', '2021-10-18',
+        'https://xb.uz/',
+        '100096, Tashkent, Chilanzar district, Katartal Street-46',
+        'Государственный банк с широкой региональной сетью и массовыми банковскими услугами.',
+        "Keng hududiy tarmoqqa ega davlat banki va ommaviy bank xizmatlari.",
+        ['Кредиты', 'Депозиты', 'Карты', 'Пенсионные услуги'],
+        ['Переводы', 'Платежи', 'Отделения и банкоматы'],
+        True,
+        'Joint-Stock Commercial People’s Bank of the Republic of Uzbekistan',
+        latitude=41.2915412,
+        longitude=69.2121361,
+    ),
+    catalog_bank(
+        'Kapitalbank', 'KB', 'kapitalbank', 'private', '69', '2001-04-07',
+        'https://kapitalbank.uz/',
+        '100047, Tashkent, Yunusabad district, Sayilgokh str., 7',
+        'Крупный частный банк с розничными, карточными и цифровыми банковскими сервисами.',
+        "Chakana, karta va raqamli bank xizmatlariga ega yirik xususiy bank.",
+        ['Кредиты', 'Депозиты', 'Карты', 'Рассрочка'],
+        ['Мобильный банкинг', 'Переводы', 'Для бизнеса'],
+        True,
+        'Joint-Stock Commercial Bank "Kapitalbank"',
+        latitude=41.3068639,
+        longitude=69.3048509,
+    ),
+    catalog_bank(
+        'Ipoteka Bank OTP', 'IB', 'ipoteka-bank', 'foreign', '74', '2021-12-25',
+        'https://ipotekabank.uz/',
+        '100000, Tashkent, Shahrisabz Street, 30',
+        'Банк с сильной специализацией в ипотеке, жилищном финансировании и розничных продуктах.',
+        "Ipoteka, uy-joy moliyalashtirishi va chakana mahsulotlarga ixtisoslashgan bank.",
+        ['Ипотека', 'Кредиты', 'Депозиты', 'Карты'],
+        ['Мобильный банкинг', 'Переводы', 'Для бизнеса'],
+        True,
+        'Joint-Stock Commercial Mortgage Bank "Ipoteka Bank"',
+        latitude=41.3152183,
+        longitude=69.2843548,
+    ),
+    catalog_bank(
+        'Hamkorbank', 'HMK', 'hamkorbank', 'private', '64', '1991-08-31',
+        'https://hamkorbank.uz/',
+        '170119, Andizhan, Babur Ave., 85',
+        'Частный банк с широкой сетью и продуктами для физических лиц, малого и среднего бизнеса.',
+        "Jismoniy shaxslar, kichik va o'rta biznes uchun keng tarmoqli xususiy bank.",
+        ['Кредиты', 'Депозиты', 'Карты', 'Бизнес-кредиты'],
+        ['Мобильный банкинг', 'Переводы', 'Для бизнеса'],
+        True,
+        'Joint-Stock Commercial Bank with foreign capital "HAMKORBANK"',
+        latitude=40.7696700,
+        longitude=72.3419411,
+    ),
+    catalog_bank(
+        'TBC Bank Uzbekistan', 'TBC', 'tbc-bank', 'private', '86', '2020-04-11',
+        'https://tbcbank.uz/',
+        '100015, Tashkent city, Mirabad district, Fidokor street 10B',
+        'Цифровой банк с дистанционными розничными сервисами и мобильным приложением.',
+        "Masofaviy chakana xizmatlar va mobil ilovaga ega raqamli bank.",
+        ['Кредиты', 'Депозиты', 'Карты', 'Рассрочка'],
+        ['Мобильный банкинг', 'Онлайн-заявка', 'Переводы'],
+        True,
+        'Joint-Stock Commercial Bank "TBC Bank"',
+        latitude=41.2970880,
+        longitude=69.2779790,
+    ),
+    catalog_bank(
+        'Anorbank', 'AN', 'anorbank', 'private', '87', '2020-08-22',
+        'https://anorbank.uz/',
+        '100170, Tashkent, Mirzo Ulugbek district, Sairam 5-passage, 4',
+        'Цифровой частный банк с розничными продуктами и дистанционным обслуживанием.',
+        "Chakana mahsulotlar va masofaviy xizmatlarga ega raqamli xususiy bank.",
+        ['Кредиты', 'Депозиты', 'Карты', 'Рассрочка'],
+        ['Мобильный банкинг', 'Онлайн-заявка', 'Переводы'],
+        True,
+        'Joint-Stock Company "ANOR BANK"',
+        latitude=41.3260000,
+        longitude=69.3360000,
+    ),
+]
+
+
+def ensure_default_banks():
+    catalog_abbrs = {bank['abbr'] for bank in DEFAULT_BANKS}
+    for bank_data in DEFAULT_BANKS:
+        bank, created = Bank.objects.get_or_create(
+            abbr=bank_data['abbr'],
+            defaults=bank_data,
+        )
+        if created:
+            continue
+
+        changed_fields = []
+        if bank.data_status == 'draft':
+            for field, value in bank_data.items():
+                if getattr(bank, field, None) != value:
+                    setattr(bank, field, value)
+                    changed_fields.append(field)
+        elif not bank.is_catalog:
+            bank.is_catalog = True
+            changed_fields.append('is_catalog')
+        if changed_fields:
+            bank.save(update_fields=sorted(set(changed_fields + ['updated_at'])))
+
+    Bank.objects.exclude(abbr__in=catalog_abbrs).update(is_catalog=False)
+
+
+def config_value_is_set(value):
+    if value is None:
+        return False
+    normalized = str(value).strip()
+    if not normalized:
+        return False
+    return not normalized.lower().startswith(PLACEHOLDER_PREFIXES)
+
+
+def mask_config_value(key, value):
+    if not config_value_is_set(value):
+        return ''
+    value = str(value)
+    if key in SECRET_CONFIG_KEYS:
+        return '****' if len(value) <= 8 else f"{value[:4]}...{value[-4:]}"
+    return value
+
+
+def config_source(key):
+    env_value = os.environ.get(key)
+    if config_value_is_set(env_value):
+        return 'env', effective_config_value(key, env_value)
+
+    alias = CONFIG_ALIASES.get(key)
+    if alias:
+        alias_env_value = os.environ.get(alias)
+        if config_value_is_set(alias_env_value):
+            return f'env:{alias}', alias_env_value
+
+    db_config = APIConfiguration.objects.filter(key=key, is_active=True).first()
+    if db_config and config_value_is_set(db_config.value):
+        return 'django_admin', effective_config_value(key, db_config.value)
+
+    if alias:
+        alias_config = APIConfiguration.objects.filter(key=alias, is_active=True).first()
+        if alias_config and config_value_is_set(alias_config.value):
+            return f'django_admin:{alias}', alias_config.value
+
+    default = CONFIG_DEFAULTS.get(key)
+    if config_value_is_set(default):
+        return 'default', default
+
+    return 'missing', ''
+
+
+def config_group_status(keys):
+    items = {}
+    configured = True
+    for key in keys:
+        source, value = config_source(key)
+        is_set = config_value_is_set(value)
+        configured = configured and is_set
+        items[key] = {
+            'configured': is_set,
+            'source': source,
+            'value': mask_config_value(key, value),
+        }
+    return {'configured': configured, 'items': items}
+
+
+def get_payme_merchant_key():
+    return get_config('PAYME_MERCHANT_KEY', 'test_merchant_secret_key')
+
+
+def get_payme_previous_merchant_key():
+    return get_config('PAYME_PREVIOUS_MERCHANT_KEY')
+
+
+def get_payme_merchant_keys():
+    candidates = [
+        os.environ.get('PAYME_MERCHANT_KEY'),
+        get_payme_merchant_key(),
+        APIConfiguration.objects.filter(key='PAYME_MERCHANT_KEY', is_active=True)
+        .values_list('value', flat=True)
+        .first(),
+    ]
+    keys = []
+    for candidate in candidates:
+        if config_value_is_set(candidate) and str(candidate) not in keys:
+            keys.append(str(candidate))
+    return keys or ['test_merchant_secret_key']
+
+
+def get_payme_auth_keys():
+    env_key = os.environ.get('PAYME_MERCHANT_KEY')
+    if config_value_is_set(env_key):
+        return [str(env_key)]
+
+    fallback_key = get_payme_merchant_key()
+    if config_value_is_set(fallback_key):
+        return [str(fallback_key)]
+
+    db_key = APIConfiguration.objects.filter(key='PAYME_MERCHANT_KEY', is_active=True).values_list('value', flat=True).first()
+    if config_value_is_set(db_key):
+        return [str(db_key)]
+
+    return ['test_merchant_secret_key']
+
+
+def set_payme_config_key(key, value, description):
+    APIConfiguration.objects.update_or_create(
+        key=key,
+        defaults={
+            'value': value,
+            'description': description,
+            'is_active': True,
+        }
+    )
+
+
+def get_payme_merchant_id():
+    return get_config('PAYME_MERCHANT_ID', 'test_merchant_id')
+
+
+def get_payme_account_key():
+    return get_config('PAYME_ACCOUNT_KEY', 'Bpay')
+
+
+def normalize_payme_checkout_url(base_url):
+    raw_url = str(base_url or '').strip().rstrip('/')
+    if not raw_url:
+        return raw_url
+
+    parsed = urlsplit(raw_url if '://' in raw_url else f'https://{raw_url}')
+    hostname = parsed.netloc.lower()
+    path = parsed.path.rstrip('/')
+
+    if hostname == 'test.paycom.uz':
+        hostname = 'checkout.test.paycom.uz'
+    elif hostname == 'paycom.uz':
+        hostname = 'checkout.paycom.uz'
+
+    if path == '/api':
+        path = ''
+
+    return urlunsplit((parsed.scheme or 'https', hostname, path, '', ''))
+
+
+def missing_payme_checkout_config():
+    return [key for key in PAYME_CHECKOUT_REQUIRED_KEYS if not config_value_is_set(get_config(key))]
+
+
+def payme_config_error_response():
+    return Response({
+        "detail": "Payme is not configured on the backend. Add the missing keys in Render Environment or Django Admin.",
+        "missing": missing_payme_checkout_config(),
+    }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+
+def build_payme_checkout_url(order):
+    missing = missing_payme_checkout_config()
+    if missing:
+        raise ValueError(f"Payme checkout is not configured: {', '.join(missing)}")
+    merchant_id = get_payme_merchant_id()
+    account_key = get_payme_account_key()
+    amount_tiyin = int(Decimal(order.amount) * 100)
+    callback = get_config('PAYME_CALLBACK_URL', 'http://127.0.0.1:8765/index.html')
+    base_url = normalize_payme_checkout_url(
+        get_config('PAYME_CHECKOUT_URL', 'https://checkout.paycom.uz')
+    )
+    normalized_account_key = str(account_key or '').strip()
+    if not normalized_account_key or normalized_account_key.lower() in {'order_id', 'orderid'}:
+        normalized_account_key = 'order_id'
+    payload = ";".join([
+        f"m={merchant_id}",
+        f"ac.{normalized_account_key}={order.id}",
+        f"a={amount_tiyin}",
+        f"c={callback}",
+        "ct=15",
+    ])
+    encoded = base64.b64encode(payload.encode('utf-8')).decode('utf-8')
+    return f"{base_url}/{quote_plus(encoded)}"
+
+
+class PaymeWebhookView(APIView):
+    permission_classes = [AllowAny]
+
+    def _rpc_result(self, result, request_id):
+        return Response({"jsonrpc": "2.0", "result": result, "id": request_id})
+
+    def post(self, request, *args, **kwargs):
+        request_id = request.data.get('id')
+        try:
+            # 1. Проверка авторизации
+            auth_header = request.headers.get('Authorization')
+            if not auth_header or not auth_header.startswith('Basic '):
+                return self._rpc_error("AUTH_ERROR", request_id)
+
+            try:
+                encoded_credentials = auth_header.split(' ')[1]
+                decoded_credentials = base64.b64decode(encoded_credentials).decode('utf-8')
+                username, password = decoded_credentials.split(':', 1)
+            except Exception:
+                return self._rpc_error("AUTH_ERROR", request_id)
+
+            # 2. Разбор JSON-RPC
+            method = request.data.get('method')
+            params = request.data.get('params', {})
+            if not isinstance(params, dict):
+                return self._rpc_error("INVALID_REQUEST", request_id)
+
+            if method == "ChangePassword":
+                return self._change_password(params, request_id, password)
+
+            if password not in get_payme_auth_keys():
+                return self._rpc_error("AUTH_ERROR", request_id)
+
+            if method == "CheckPerformTransaction":
+                return self._check_perform_transaction(params, request_id)
+            elif method == "CreateTransaction":
+                return self._create_transaction(params, request_id)
+            elif method == "PerformTransaction":
+                return self._perform_transaction(params, request_id)
+            elif method == "CancelTransaction":
+                return self._cancel_transaction(params, request_id)
+            elif method == "CheckTransaction":
+                return self._check_transaction(params, request_id)
+            elif method == "GetStatement":
+                return self._get_statement(params, request_id)
+
+            return self._rpc_error("METHOD_NOT_FOUND", request_id, data=method)
+        except Exception:
+            return self._rpc_error("INTERNAL_ERROR", request_id)
+
+    def _extract_order_id(self, params):
+        account = params.get('account') or {}
+        if not isinstance(account, dict):
+            return None
+        account_key = get_payme_account_key()
+        candidate_keys = ['order_id', 'OrderId', 'order', 'id', account_key, 'Bpay', 'bpay']
+        fallback_value = None
+        for key in candidate_keys:
+            value = account.get(key)
+            if value in [None, '']:
+                continue
+            value_str = str(value).strip()
+            if value_str.isdigit():
+                return value_str
+            if fallback_value is None:
+                fallback_value = value_str
+        if fallback_value is not None:
+            return fallback_value
+        for value in account.values():
+            if isinstance(value, (str, int)) and str(value).strip():
+                return value
+        return None
+
+    def _is_sandbox_account_alias(self, params):
+        account = params.get('account') or {}
+        if not isinstance(account, dict):
+            return False
+
+        account_key = str(get_payme_account_key() or '').strip()
+        alias_values = {account_key, 'Bpay', 'bpay', 'order_id'}
+
+        for key in [account_key, 'Bpay', 'bpay', 'order_id', 'OrderId', 'order']:
+            if not key:
+                continue
+            value = account.get(key)
+            if value is None:
+                continue
+            if str(value).strip() in alias_values:
+                return True
+        return False
+
+    def _normalize_order_id(self, value):
+        if value in [None, '']:
+            return None
+        value = str(value).strip()
+        return int(value) if value.isdigit() else None
+
+    def _get_or_create_sandbox_order(self):
+        order = Order.objects.filter(
+            target_id=PAYME_SANDBOX_ALIAS_TARGET_ID,
+            purpose='card_order',
+            amount=PAYME_SANDBOX_DEFAULT_AMOUNT_UZS,
+            status='pending',
+        ).order_by('-id').first()
+        if order:
+            return order
+
+        return Order.objects.create(
+            amount=PAYME_SANDBOX_DEFAULT_AMOUNT_UZS,
+            purpose='card_order',
+            target_id=PAYME_SANDBOX_ALIAS_TARGET_ID,
+            description='Payme sandbox test order',
+        )
+
+    def _get_order_from_params(self, params, amount_tiyin=None):
+        order_id = self._normalize_order_id(self._extract_order_id(params))
+        if order_id is None:
+            if self._is_sandbox_account_alias(params):
+                return self._get_or_create_sandbox_order()
+            return None
+        return Order.objects.filter(id=order_id).first()
+
+    def _merchant_transaction_id(self, tx):
+        return str(tx.id)
+
+    def _statement_account(self, tx):
+        account_key = get_payme_account_key()
+        if tx.order.target_id == PAYME_SANDBOX_ALIAS_TARGET_ID:
+            return {account_key: account_key}
+        return {account_key: str(tx.order_id)}
+
+    def _amount_tiyin(self, amount):
+        try:
+            return int(amount)
+        except (TypeError, ValueError):
+            return None
+
+    def _create_transaction_result(self, tx):
+        return {
+            "create_time": tx.create_time,
+            "transaction": self._merchant_transaction_id(tx),
+            "state": tx.state,
+        }
+
+    def _perform_transaction_result(self, tx):
+        return {
+            "transaction": self._merchant_transaction_id(tx),
+            "perform_time": tx.perform_time,
+            "state": tx.state,
+        }
+
+    def _ensure_payme_card_linked(self, order):
+        if not order.user:
+            return
+
+        profile, _ = UserProfile.objects.get_or_create(user=order.user)
+        if profile.myid_status != 'verified':
+            profile.myid_status = 'verified'
+            profile.save(update_fields=['myid_status'])
+
+        if Card.objects.filter(user=order.user, provider='payme', payme_verified=True).exists():
+            return
+
+        import random
+        card_num = f"86000691{random.randint(10000000, 99999999)}"
+        Card.objects.create(
+            user=order.user,
+            number=f"{card_num[:4]} {card_num[4:8]} {card_num[8:12]} {card_num[12:]}",
+            expiry="03/29",
+            balance=Decimal('500000.00'),
+            name="Payme Humo",
+            provider="payme",
+            payme_verified=True,
+        )
+
+    def _cancel_transaction_result(self, tx):
+        return {
+            "transaction": self._merchant_transaction_id(tx),
+            "cancel_time": tx.cancel_time,
+            "state": tx.state,
+        }
+
+    def _check_transaction_result(self, tx):
+        return {
+            "create_time": tx.create_time,
+            "perform_time": tx.perform_time,
+            "cancel_time": tx.cancel_time,
+            "transaction": self._merchant_transaction_id(tx),
+            "state": tx.state,
+            "reason": tx.reason,
+        }
+
+    def _now_ms(self):
+        return int(time.time() * 1000)
+
+    def _transaction_is_timed_out(self, tx):
+        return tx.state == 1 and self._now_ms() - int(tx.create_time or 0) > PAYME_TRANSACTION_TIMEOUT_MS
+
+    def _expire_transaction(self, tx):
+        tx.state = -1
+        tx.reason = 4
+        tx.cancel_time = self._now_ms()
+        tx.save(update_fields=['state', 'reason', 'cancel_time'])
+        tx.order.status = 'canceled'
+        tx.order.save(update_fields=['status'])
+        Investment.objects.filter(order=tx.order).update(status='canceled')
+
+    def _active_transaction_for_order(self, order, payme_id):
+        tx = PaymeTransaction.objects.filter(order=order, state=1).exclude(payme_id=payme_id).order_by('-create_time').first()
+        if tx and self._transaction_is_timed_out(tx):
+            self._expire_transaction(tx)
+            return None
+        return tx
+
+    def _check_perform_transaction(self, params, request_id):
+        amount = params.get('amount')
+        amount_tiyin = self._amount_tiyin(amount)
+
+        if amount_tiyin is None:
+            return self._rpc_error("INVALID_AMOUNT", request_id)
+
+        order = self._get_order_from_params(params, amount_tiyin)
+        if not order:
+            return self._rpc_error("ORDER_NOT_FOUND", request_id)
+
+        if int(order.amount * 100) != amount_tiyin:
+            return self._rpc_error("INVALID_AMOUNT", request_id)
+
+        if order.status != 'pending':
+            return self._rpc_error("CANT_PERFORM", request_id)
+
+        return self._rpc_result({"allow": True}, request_id)
+
+    def _create_transaction(self, params, request_id):
+        payme_id = params.get('id')
+        amount = params.get('amount')
+        create_time = params.get('time')
+        amount_tiyin = self._amount_tiyin(amount)
+
+        if amount_tiyin is None:
+            return self._rpc_error("INVALID_AMOUNT", request_id)
+
+        order = self._get_order_from_params(params, amount_tiyin)
+        if not order:
+            return self._rpc_error("ORDER_NOT_FOUND", request_id)
+
+        if int(order.amount * 100) != amount_tiyin:
+            return self._rpc_error("INVALID_AMOUNT", request_id)
+
+        try:
+            tx = PaymeTransaction.objects.get(payme_id=payme_id)
+            if tx.order_id != order.id or int(tx.amount) != amount_tiyin:
+                return self._rpc_error("CANT_PERFORM", request_id)
+            if self._transaction_is_timed_out(tx):
+                self._expire_transaction(tx)
+                return self._rpc_error("CANT_PERFORM", request_id)
+            return self._rpc_result(self._create_transaction_result(tx), request_id)
+        except PaymeTransaction.DoesNotExist:
+            pass
+
+        if self._active_transaction_for_order(order, payme_id):
+            return self._rpc_error("ORDER_BUSY", request_id)
+
+        if order.status != 'pending':
+            return self._rpc_error("CANT_PERFORM", request_id)
+
+        tx = PaymeTransaction.objects.create(payme_id=payme_id, order=order, amount=amount, state=1, create_time=create_time)
+        return self._rpc_result(self._create_transaction_result(tx), request_id)
+
+    def _perform_transaction(self, params, request_id):
+        payme_id = params.get('id')
+
+        try:
+            tx = PaymeTransaction.objects.get(payme_id=payme_id)
+        except PaymeTransaction.DoesNotExist:
+            return self._rpc_error("TRANSACTION_NOT_FOUND", request_id)
+
+        if self._transaction_is_timed_out(tx):
+            self._expire_transaction(tx)
+            return self._rpc_error("CANT_PERFORM", request_id)
+
+        if tx.state == 1:
+            current_time_ms = self._now_ms()
+            tx.state = 2
+            tx.perform_time = current_time_ms
+            tx.save()
+
+            order = tx.order
+            order.status = 'paid'
+            order.save()
+            Investment.objects.filter(order=order).update(status='paid')
+            for investment in Investment.objects.filter(order=order, startup__isnull=False):
+                startup = investment.startup
+                startup.amount_raised = startup.amount_raised + investment.amount
+                startup.save(update_fields=['amount_raised', 'updated_at'])
+
+            # If this is a registration or card connection order, connect the profile and card
+            if order.purpose in ['card_order', 'application'] and order.user:
+                self._ensure_payme_card_linked(order)
+        elif tx.state != 2:
+            return self._rpc_error("CANT_PERFORM", request_id)
+
+        return self._rpc_result(self._perform_transaction_result(tx), request_id)
+
+
+    def _cancel_transaction(self, params, request_id):
+        payme_id = params.get('id')
+        reason = params.get('reason')
+
+        try:
+            tx = PaymeTransaction.objects.get(payme_id=payme_id)
+        except PaymeTransaction.DoesNotExist:
+            return self._rpc_error("TRANSACTION_NOT_FOUND", request_id)
+
+        if tx.state in [-1, -2]:
+            return self._rpc_result(self._cancel_transaction_result(tx), request_id)
+
+        current_time_ms = self._now_ms()
+        tx.cancel_time = current_time_ms
+        tx.reason = reason
+        tx.state = -2 if tx.state == 2 else -1
+        tx.save()
+
+        order = tx.order
+        order.status = 'canceled'
+        order.save(update_fields=['status'])
+        Investment.objects.filter(order=order).update(status='canceled')
+
+        return self._rpc_result(self._cancel_transaction_result(tx), request_id)
+
+    def _check_transaction(self, params, request_id):
+        payme_id = params.get('id')
+
+        try:
+            tx = PaymeTransaction.objects.get(payme_id=payme_id)
+        except PaymeTransaction.DoesNotExist:
+            return self._rpc_error("TRANSACTION_NOT_FOUND", request_id)
+
+        return self._rpc_result(self._check_transaction_result(tx), request_id)
+
+    def _get_statement(self, params, request_id):
+        from_time = params.get('from', 0)
+        to_time = params.get('to', int(time.time() * 1000))
+        transactions = PaymeTransaction.objects.filter(create_time__gte=from_time, create_time__lte=to_time).order_by('create_time')
+        return self._rpc_result({"transactions": [
+            {
+                "id": tx.payme_id,
+                "time": tx.create_time,
+                "amount": tx.amount,
+                "account": self._statement_account(tx),
+                "create_time": tx.create_time,
+                "perform_time": tx.perform_time,
+                "cancel_time": tx.cancel_time,
+                "transaction": self._merchant_transaction_id(tx),
+                "state": tx.state,
+                "reason": tx.reason,
+            }
+            for tx in transactions
+        ]}, request_id)
+
+    def _rpc_error(self, error_type, request_id, data=None):
+        error_data = PAYME_ERRORS.get(error_type, {"code": -32603, "message": {"ru": "Внутренняя ошибка", "uz": "Ichki xatolik", "en": "Internal error"}})
+        if error_type in ["ORDER_NOT_FOUND", "ORDER_BUSY"]:
+            error_data = {**error_data, "data": get_payme_account_key()}
+        if error_type == "METHOD_NOT_FOUND":
+            error_data = {
+                "code": -32601,
+                "message": {"ru": "Метод не найден", "uz": "Metod topilmadi", "en": "Method not found"},
+                "data": data,
+            }
+        return Response({"jsonrpc": "2.0", "error": error_data, "id": request_id})
+
+    def _change_password(self, params, request_id, auth_password=None):
+        new_password = str(params.get('password') or '').strip()
+        if not new_password:
+            return self._rpc_error("INVALID_REQUEST", request_id)
+
+        current_password = get_payme_auth_keys()[0]
+        previous_password = get_payme_previous_merchant_key()
+
+        if new_password == current_password:
+            return self._rpc_error("AUTH_ERROR", request_id)
+
+        # Payme checks that the old password is no longer accepted after rotation.
+        if previous_password and new_password == str(previous_password).strip():
+            return self._rpc_error("AUTH_ERROR", request_id)
+
+        if auth_password and auth_password != current_password:
+            return self._rpc_error("AUTH_ERROR", request_id)
+
+        set_payme_config_key(
+            'PAYME_PREVIOUS_MERCHANT_KEY',
+            current_password,
+            'Previous Payme merchant key saved during ChangePassword',
+        )
+        set_payme_config_key(
+            'PAYME_MERCHANT_KEY',
+            new_password,
+            'Payme merchant key updated by ChangePassword',
+        )
+        return self._rpc_result({"success": True}, request_id)
+
+from .serializers import CardSerializer
+
+
+class IntegrationStatusView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        payme_env_keys = sorted(key for key in os.environ if key.startswith('PAYME_'))
+        return Response({
+            'registration_provider': 'standard',
+            'runtime': {
+                'host': request.get_host(),
+                'render': bool(os.environ.get('RENDER')),
+                'render_external_hostname': os.environ.get('RENDER_EXTERNAL_HOSTNAME', ''),
+                'render_service_name': os.environ.get('RENDER_SERVICE_NAME', ''),
+                'render_git_commit': os.environ.get('RENDER_GIT_COMMIT', ''),
+                'payme_env_keys_present': payme_env_keys,
+            },
+            'payme_merchant': config_group_status([
+                'PAYME_MERCHANT_ID',
+                'PAYME_MERCHANT_KEY',
+                'PAYME_CHECKOUT_URL',
+                'PAYME_CALLBACK_URL',
+                'PAYME_ACCOUNT_KEY',
+            ]),
+            'payme_subscribe': config_group_status([
+                'PAYME_SUBSCRIBE_ID',
+                'PAYME_SUBSCRIBE_KEY',
+                'PAYME_SUBSCRIBE_BASE_URL',
+            ]),
+            'octo_p2p': {
+                **config_group_status([
+                    'OCTO_P2P_ENABLED',
+                    'OCTO_SECRET_KEY',
+                    'OCTO_SHOP_ID',
+                    'OCTO_P2P_ENDPOINT',
+                    'OCTO_API_BASE_URL',
+                ]),
+                'runtime': octo_p2p_status(),
+                'note': 'Public Octo docs cover merchant acquiring; P2P requires OCTO Money Transfer activation.',
+            },
+            'sms': config_group_status([
+                'SMS_DEMO_MODE',
+                'SMS_DEMO_CODE',
+                'SMS_PROVIDER_URL',
+                'SMS_PROVIDER_TOKEN',
+            ]),
+            'myid': {
+                **config_group_status([
+                    'MYID_BASE_URL',
+                    'MYID_CLIENT_ID',
+                    'MYID_CLIENT_SECRET',
+                    'MYID_CLIENT_HASH',
+                    'MYID_CLIENT_HASH_ID',
+                    'MYID_USERNAME',
+                    'MYID_PASSWORD',
+                    'MYID_HOSTED_URL',
+                    'MYID_AUTHORIZATION_URL',
+                    'MYID_REDIRECT_URI',
+                ]),
+                'configured': myid_sdk_is_configured() or myid_redirect_is_configured(),
+                'mobile_sdk': {
+                    'configured': myid_sdk_is_configured(),
+                    'environment': (
+                        'demo'
+                        if 'devmyid' in str(get_config('MYID_BASE_URL', '')).lower()
+                        else 'production'
+                    ),
+                },
+                'web_redirect': {
+                    **config_group_status([
+                        'MYID_BASE_URL',
+                        'MYID_CLIENT_ID',
+                        'MYID_CLIENT_SECRET',
+                        'MYID_AUTHORIZATION_URL',
+                        'MYID_REDIRECT_URI',
+                    ]),
+                    'callback_path': reverse('auth_myid_redirect_callback'),
+                },
+                'used_for_registration': True,
+            },
+            'notes': [
+                'Secrets are masked and never returned fully.',
+                'Django Admin values override .env values when active.',
+                'Registration is standard email/password by default; Payme checkout is opt-in with payme_connect=true.',
+            ],
+        })
+
+
+class HealthView(APIView):
+    """Small unauthenticated liveness endpoint for hosting checks."""
+
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        return Response({'status': 'ok'})
+
+
+class BankListView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        ensure_default_banks()
+        banks = Bank.objects.filter(is_catalog=True).order_by('-is_recommended', 'name')
+        return Response(BankSerializer(banks, many=True).data)
+
+
+class BankDetailView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, pk):
+        ensure_default_banks()
+        try:
+            bank = Bank.objects.get(pk=pk, is_catalog=True)
+        except Bank.DoesNotExist:
+            return Response({'detail': 'Bank not found.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(BankSerializer(bank).data)
+
+
+class NewsListView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        queryset = NewsArticle.objects.filter(is_published=True)
+        category = request.query_params.get('category')
+        if category:
+            queryset = queryset.filter(category=category)
+        if request.query_params.get('featured') in {'1', 'true', 'yes'}:
+            queryset = queryset.filter(is_featured=True)
+
+        try:
+            limit = min(max(int(request.query_params.get('limit', 6)), 1), 30)
+        except (TypeError, ValueError):
+            limit = 6
+
+        return Response(NewsArticleSerializer(
+            queryset.order_by('-published_at', '-created_at')[:limit],
+            many=True,
+            context={'request': request},
+        ).data)
+
+
+class NewsDetailView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, slug):
+        try:
+            article = NewsArticle.objects.get(slug=slug, is_published=True)
+        except NewsArticle.DoesNotExist:
+            return Response({'detail': 'News article not found.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(NewsArticleSerializer(article, context={'request': request}).data)
+
+
+class PaymeDepositRatesView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        ensure_default_banks()
+        rates = [
+            {
+                'name': bank.name,
+                'apy': float(bank.apy or 0),
+                'min_amount': float(bank.min_deposit or 0),
+            }
+            for bank in Bank.objects.all().order_by('-apy')[:12]
+        ]
+        return Response({
+            'source': 'backend_local',
+            'rates': rates,
+        })
+
+
+class AuthQrStartView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        session = _create_auth_session(
+            kind='web_qr',
+            phone=str(request.data.get('phone', '')).strip(),
+            email=str(request.data.get('email', '')).strip().lower(),
+            account_type=request.data.get('account_type', 'physical'),
+            expires_in_seconds=WEB_LOGIN_SESSION_TTL_SECONDS,
+        )
+        if not session.qr_payload:
+            session.qr_payload = _session_qr_payload(session.session_id)
+        session.save(update_fields=['qr_payload', 'updated_at'])
+        return Response({
+            'session_id': session.session_id,
+            'status': session.status,
+            'expires_at': session.expires_at.isoformat(),
+            'qr_payload': session.qr_payload,
+            'qr_image': _qr_data_url(session.qr_payload),
+        }, status=status.HTTP_201_CREATED)
+
+
+class AuthQrStatusView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        session_id = str(request.data.get('session_id', '')).strip()
+        session = AuthSession.objects.filter(session_id=session_id, kind='web_qr').select_related('user').first()
+        if not session:
+            return Response({'detail': 'QR session not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        session = _ensure_auth_session_active(session)
+        if session.status != 'verified' or not session.user:
+            return Response(_auth_session_payload(session))
+
+        tokens = _issue_tokens(session.user)
+        payload = _auth_session_payload(session)
+        payload['tokens'] = tokens
+        profile, _ = UserProfile.objects.get_or_create(user=session.user)
+        payload['profile'] = {
+            'id': session.user.id,
+            'email': session.user.email,
+            'phone': profile.phone or session.phone,
+            'myid_status': profile.myid_status,
+        }
+        return Response(payload)
+
+
+class MyIDWebRedirectStartView(APIView):
+    """Prepare a browser OAuth redirect to the hosted MyID screen."""
+
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        flow = str(request.data.get('flow') or 'login').strip().lower()
+        if flow not in {'login', 'register'}:
+            return Response({'detail': 'flow must be login or register'}, status=status.HTTP_400_BAD_REQUEST)
+
+        first_name = str(request.data.get('first_name') or '').strip()
+        last_name = str(request.data.get('last_name') or '').strip()
+        email = str(request.data.get('email') or '').strip().lower()
+        phone = str(request.data.get('phone') or '').strip()
+        password = str(request.data.get('password') or '')
+        account_type = _normalize_account_type(request.data.get('account_type', 'physical'))
+        agreed_value = request.data.get('agreed_on_terms')
+        agreed = agreed_value is True or str(agreed_value).lower() in ['1', 'true', 'yes', 'on']
+
+        if flow == 'register':
+            if not first_name or not last_name:
+                return Response({'first_name': 'First name and last name are required.'}, status=status.HTTP_400_BAD_REQUEST)
+            if '@' not in email or '.' not in email.rsplit('@', 1)[-1]:
+                return Response({'email': 'Enter a valid email address.'}, status=status.HTTP_400_BAD_REQUEST)
+            if len(password) < 6:
+                return Response({'password': 'Password must be at least 6 characters.'}, status=status.HTTP_400_BAD_REQUEST)
+            if not agreed:
+                return Response({'agreed_on_terms': 'Consent is required before MyID verification.'}, status=status.HTTP_400_BAD_REQUEST)
+        elif not email and not phone:
+            return Response({'detail': 'email or phone is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not myid_redirect_is_configured():
+            return Response({
+                'detail': 'MyID web redirect is not configured. Add the server-side MYID_CLIENT_SECRET and register the callback URL in MyID.',
+                'required_config': ['MYID_BASE_URL', 'MYID_CLIENT_ID', 'MYID_CLIENT_SECRET'],
+            }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        session = _create_auth_session(
+            kind='myid_web',
+            phone=phone,
+            email=email,
+            account_type=account_type,
+            expires_in_seconds=MYID_WEB_SESSION_TTL_SECONDS,
+        )
+        session.myid_payload = {
+            'source': 'myid_web_redirect',
+            'flow': flow,
+            'first_name': first_name,
+            'last_name': last_name,
+            # Only a one-way hash is kept while the hosted flow is pending.
+            'password_hash': make_password(password) if flow == 'register' else '',
+            'agreed_on_terms': agreed,
+            'state': session.session_id,
+        }
+        session.save(update_fields=['myid_payload', 'updated_at'])
+
+        redirect_uri = _myid_redirect_uri(request)
+        redirect_url = myid_authorization_url(
+            redirect_uri=redirect_uri,
+            state=session.session_id,
+            scope=str(get_config('MYID_SCOPE', MYID_WEB_SCOPE) or MYID_WEB_SCOPE),
+            method='strong',
+        )
+        return Response({
+            'session_id': session.session_id,
+            'flow': flow,
+            'status': session.status,
+            'expires_at': session.expires_at.isoformat(),
+            'redirect_uri': redirect_uri,
+            'redirect_url': redirect_url,
+        }, status=status.HTTP_201_CREATED)
+
+
+class MyIDWebRedirectCallbackView(APIView):
+    """Receive MyID's one-time code and finish verification server-side."""
+
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        state = str(request.query_params.get('state') or '').strip()
+        code = str(request.query_params.get('auth_code') or request.query_params.get('code') or '').strip()
+        reason_code = str(request.query_params.get('reason_code') or '').strip()
+        session = AuthSession.objects.filter(session_id=state, kind='myid_web').first()
+
+        if not session:
+            return HttpResponseRedirect(_redirect_result_url(
+                status_value='failed',
+                reason_code=reason_code or 'invalid_state',
+                message='MyID session was not found.',
+            ))
+
+        session = _ensure_auth_session_active(session)
+        if session.status == 'expired':
+            return HttpResponseRedirect(_redirect_result_url(
+                session_id=session.session_id,
+                status_value='expired',
+                reason_code=reason_code,
+                message='MyID session expired. Start again.',
+            ))
+
+        if not code:
+            session.status = 'failed'
+            session.last_error = reason_code or 'MyID did not return an authorization code.'
+            session.save(update_fields=['status', 'last_error', 'updated_at'])
+            return HttpResponseRedirect(_redirect_result_url(
+                session_id=session.session_id,
+                status_value='failed',
+                reason_code=reason_code,
+                message='MyID verification was not completed.',
+            ))
+
+        try:
+            token_payload = exchange_myid_authorization_code(code)
+            access_token = str(token_payload.get('access_token') or '').strip()
+            if not access_token:
+                raise ValueError('MyID did not return an access token.')
+            provider_profile = _myid_profile_values(get_myid_user_profile(access_token))
+        except Exception:
+            # Never send provider responses or credentials back to the browser.
+            session.status = 'failed'
+            session.last_error = 'MyID authorization code exchange failed.'
+            session.save(update_fields=['status', 'last_error', 'updated_at'])
+            return HttpResponseRedirect(_redirect_result_url(
+                session_id=session.session_id,
+                status_value='failed',
+                reason_code='provider_error',
+                message='MyID verification could not be completed. Try again.',
+            ))
+
+        requested = session.myid_payload if isinstance(session.myid_payload, dict) else {}
+        flow = str(requested.get('flow') or 'login')
+        phone = provider_profile['phone'] or session.phone
+        email = provider_profile['email'] or session.email
+        if not phone and not email:
+            session.status = 'failed'
+            session.last_error = 'MyID did not return a phone or email to match the B1 account.'
+            session.save(update_fields=['status', 'last_error', 'updated_at'])
+            return HttpResponseRedirect(_redirect_result_url(
+                session_id=session.session_id,
+                status_value='failed',
+                reason_code='identity_contact_missing',
+                message='MyID не вернул телефон или email для привязки аккаунта.',
+            ))
+        first_name = provider_profile['first_name'] or str(requested.get('first_name') or '')
+        last_name = provider_profile['last_name'] or str(requested.get('last_name') or '')
+        if flow == 'login':
+            user = _user_identity_lookup(phone=phone, email=email)
+            if user is None:
+                session.status = 'failed'
+                session.last_error = 'No B1 account matches the verified MyID identity. Register first.'
+                session.save(update_fields=['status', 'last_error', 'updated_at'])
+                return HttpResponseRedirect(_redirect_result_url(
+                    session_id=session.session_id,
+                    status_value='failed',
+                    reason_code='account_not_found',
+                    message='Аккаунт не найден. Сначала зарегистрируйтесь через MyID.',
+                ))
+            profile, _ = UserProfile.objects.get_or_create(user=user)
+        else:
+            user, profile = _get_or_create_myid_user(
+                phone=phone,
+                email=email,
+                first_name=first_name,
+                last_name=last_name,
+                password_hash=str(requested.get('password_hash') or ''),
+            )
+        if provider_profile['passport']:
+            profile.passport = provider_profile['passport']
+        if provider_profile['birth_date']:
+            try:
+                profile.birth_date = date.fromisoformat(provider_profile['birth_date'][:10])
+            except (TypeError, ValueError):
+                pass
+        profile.myid_status = 'verified'
+        profile.myid_session_id = session.session_id
+        profile.myid_payload = {
+            'source': 'myid_web_redirect',
+            'authentication_method': provider_profile['authentication_method'],
+            'result_code': '1',
+        }
+        profile.save()
+
+        session.user = user
+        session.status = 'verified'
+        session.verified_at = timezone.now()
+        session.phone = phone or session.phone
+        session.email = email or session.email
+        session.last_error = ''
+        session.myid_payload = {
+            'source': 'myid_web_redirect',
+            'flow': flow,
+            'result_code': '1',
+            'authentication_method': provider_profile['authentication_method'],
+            'handoff_consumed_at': '',
+        }
+        session.save(update_fields=[
+            'user', 'status', 'verified_at', 'phone', 'email', 'last_error',
+            'myid_payload', 'updated_at',
+        ])
+        return HttpResponseRedirect(_redirect_result_url(
+            session_id=session.session_id,
+            status_value='verified',
+        ))
+
+
+class MyIDWebRedirectCompleteView(APIView):
+    """Exchange the short-lived browser handoff for B1 JWT tokens."""
+
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        session_id = str(request.data.get('session_id') or '').strip()
+        session = AuthSession.objects.filter(session_id=session_id, kind='myid_web').select_related('user').first()
+        if not session:
+            return Response({'detail': 'MyID web session not found.'}, status=status.HTTP_404_NOT_FOUND)
+        session = _ensure_auth_session_active(session)
+        if session.status != 'verified' or not session.user:
+            return Response({
+                'session_id': session.session_id,
+                'status': session.status,
+                'error': session.last_error or 'MyID verification is not complete.',
+            }, status=status.HTTP_400_BAD_REQUEST)
+        payload = session.myid_payload if isinstance(session.myid_payload, dict) else {}
+        if payload.get('handoff_consumed_at'):
+            return Response({'detail': 'This MyID handoff has already been used.'}, status=status.HTTP_410_GONE)
+
+        payload['handoff_consumed_at'] = timezone.now().isoformat()
+        session.myid_payload = payload
+        session.save(update_fields=['myid_payload', 'updated_at'])
+        profile, _ = UserProfile.objects.get_or_create(user=session.user)
+        return Response({
+            'session_id': session.session_id,
+            'status': 'verified',
+            'tokens': _issue_tokens(session.user),
+            'profile': {
+                'id': session.user.id,
+                'email': session.user.email,
+                'first_name': session.user.first_name,
+                'last_name': session.user.last_name,
+                'phone': profile.phone or session.phone,
+                'myid_status': profile.myid_status,
+            },
+        })
+
+
+class MobileMyIDStartView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        phone = str(request.data.get('phone', '')).strip()
+        if not phone:
+            return Response({'detail': 'phone is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        email = str(request.data.get('email', '')).strip().lower()
+        account_type = _normalize_account_type(request.data.get('account_type', 'physical'))
+        flow = str(request.data.get('flow') or 'login').strip().lower()
+        if flow not in {'login', 'register'}:
+            return Response({'detail': 'flow must be login or register'}, status=status.HTTP_400_BAD_REQUEST)
+        first_name = str(request.data.get('first_name') or '').strip()
+        last_name = str(request.data.get('last_name') or '').strip()
+        password = str(request.data.get('password') or '')
+        agreed_value = request.data.get('agreed_on_terms')
+        agreed = agreed_value is True or str(agreed_value).lower() in ['1', 'true', 'yes', 'on']
+        if flow == 'register':
+            if not first_name or not last_name or not email:
+                return Response({'detail': 'first_name, last_name and email are required for registration'}, status=status.HTTP_400_BAD_REQUEST)
+            if len(password) < 6:
+                return Response({'detail': 'password must be at least 6 characters'}, status=status.HTTP_400_BAD_REQUEST)
+            if not agreed:
+                return Response({'detail': 'agreed_on_terms is required for registration'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Create session via MyID /api/v2/sdk/sessions
+        pinfl = str(request.data.get('pinfl') or '').strip()
+        birth_date = str(request.data.get('birth_date') or '').strip()
+        myid_result = create_myid_sdk_session(phone=phone, pinfl=pinfl, birth_date=birth_date)
+        myid_session_id = str(myid_result.get('session_id') or '').strip()
+        if not myid_session_id:
+            return Response(
+                {'detail': 'MyID did not return a session_id. Please try again later.'},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        session = _create_auth_session(
+            kind='myid_mobile',
+            phone=phone,
+            email=email or f'{phone.replace("+", "").replace(" ", "")}@bpay.local',
+            account_type=account_type,
+            expires_in_seconds=MYID_LOGIN_SESSION_TTL_SECONDS,
+        )
+        session.myid_payload = {
+            'source': 'mobile_sdk_v2',
+            'phone': phone,
+            'account_type': account_type,
+            'flow': flow,
+            'first_name': first_name,
+            'last_name': last_name,
+            'agreed_on_terms': agreed,
+            'password_hash': make_password(password) if flow == 'register' else '',
+            'myid_session_id': myid_session_id,
+            'demo': myid_result.get('demo', False),
+        }
+        session.myid_session_id = myid_session_id
+        session.save(update_fields=['myid_payload', 'myid_session_id', 'updated_at'])
+
+        # Determine SDK environment: Flutter MyID SDK expects 'demo' or 'production'.
+        # Send 'demo' when backend is in test mode OR using api.devmyid.uz.
+        is_demo = myid_result.get('demo', False)
+        base_url = (get_config('MYID_BASE_URL') or '').rstrip('/').lower()
+        is_devmyid = 'devmyid' in base_url
+        sdk_environment = 'demo' if (is_demo or is_devmyid) else 'production'
+
+        return Response({
+            'session_id': session.session_id,
+            'phone': session.phone,
+            'email': session.email,
+            'account_type': session.account_type,
+            'flow': flow,
+            'myid_session_id': myid_session_id,
+            # Kept for older clients; the Flutter APK uses myid_session_id.
+            'client_id': get_config('MYID_CLIENT_ID', ''),
+            'client_hash': myid_result.get('client_hash', ''),
+            'client_hash_id': myid_result.get('client_hash_id', ''),
+            'environment': sdk_environment,
+            'entry_type': 'IDENTIFICATION',
+            'status': session.status,
+            'expires_at': session.expires_at.isoformat(),
+            'demo': myid_result.get('demo', False),
+        }, status=status.HTTP_201_CREATED)
+
+
+class MobileMyIDStatusView(APIView):
+    """Return a redacted local/provider status for a mobile SDK session.
+
+    This endpoint is intentionally read-only.  It never returns provider
+    access tokens, client secrets, SDK hashes, passport data, or the one-time
+    authorization code.  It is primarily a support/diagnostic endpoint for a
+    device that is stuck in the MyID camera flow.
+    """
+
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        local_session_id = str(request.query_params.get('session_id') or '').strip()
+        if not local_session_id:
+            return Response({'detail': 'session_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        session = AuthSession.objects.filter(
+            session_id=local_session_id,
+            kind='myid_mobile',
+        ).first()
+        if not session:
+            return Response({'detail': 'MyID mobile session not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        session = _ensure_auth_session_active(session)
+        payload = session.myid_payload if isinstance(session.myid_payload, dict) else {}
+        provider_session_id = session.myid_session_id or payload.get('myid_session_id')
+        response = {
+            'session_id': session.session_id,
+            'status': session.status,
+            'expires_at': session.expires_at.isoformat(),
+            'provider_status': 'unavailable',
+            'provider_attempts': [],
+        }
+        if not provider_session_id:
+            response['provider_status'] = 'missing_session'
+            return Response(response, status=status.HTTP_502_BAD_GATEWAY)
+
+        try:
+            provider_payload = get_myid_sdk_session_status(provider_session_id)
+        except Exception:
+            # Do not leak provider URLs, tokens, or raw error bodies to a
+            # public client.  The full exception remains in server logs.
+            response['provider_status'] = 'unavailable'
+            return Response(response, status=status.HTTP_502_BAD_GATEWAY)
+
+        response['provider_status'] = provider_payload.get('status', 'unknown')
+        attempts = provider_payload.get('attempts')
+        if isinstance(attempts, list):
+            response['provider_attempts'] = [
+                {
+                    'timestamp': item.get('timestamp'),
+                    'reason': item.get('reason'),
+                    'reason_code': item.get('reason_code'),
+                }
+                for item in attempts[-5:]
+                if isinstance(item, dict)
+            ]
+        return Response(response)
+
+
+class MobileMyIDEventView(APIView):
+    """Accept non-sensitive SDK lifecycle events for camera diagnostics.
+
+    The request middleware stores the redacted request in Django Admin.  This
+    endpoint intentionally accepts only a local session id and event metadata;
+    it never accepts images, PINFL, tokens, or MyID credentials.
+    """
+
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        session_id = str(request.data.get('session_id') or '').strip()
+        event_type = str(request.data.get('type') or '').strip()[:40]
+        event = str(request.data.get('event') or '').strip()[:80]
+        if not session_id or not event_type:
+            return Response(
+                {'detail': 'session_id and type are required'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not AuthSession.objects.filter(
+            session_id=session_id,
+            kind='myid_mobile',
+        ).exists():
+            return Response(
+                {'detail': 'MyID mobile session not found'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        return Response({'status': 'accepted', 'event': event}, status=status.HTTP_202_ACCEPTED)
+
+
+class MobileMyIDCompleteView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        session_id = str(request.data.get('session_id', '')).strip()
+        session = AuthSession.objects.filter(session_id=session_id, kind='myid_mobile').select_related('user').first()
+        if not session:
+            return Response({'detail': 'MyID session not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        session = _ensure_auth_session_active(session)
+        if session.status == 'expired':
+            return Response({'detail': 'MyID session expired'}, status=status.HTTP_400_BAD_REQUEST)
+
+        result_code = str(request.data.get('result_code') or request.data.get('code') or '').strip()
+        success = result_code == '1'
+        if not success:
+            session.status = 'failed'
+            session.last_error = request.data.get('error') or f'MyID result code: {result_code or "failed"}'
+            session.save(update_fields=['status', 'last_error', 'updated_at'])
+            return Response({
+                'session_id': session.session_id,
+                'status': session.status,
+                'error': session.last_error,
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Exchange SDK code for profile
+        sdk_code = str(request.data.get('sdk_code') or '').strip()
+        if not sdk_code:
+            session.status = 'failed'
+            session.last_error = 'MyID SDK did not return a code to exchange for profile data.'
+            session.save(update_fields=['status', 'last_error', 'updated_at'])
+            return Response({
+                'session_id': session.session_id,
+                'status': session.status,
+                'error': session.last_error,
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            myid_data = exchange_myid_sdk_code(sdk_code)
+        except Exception as exc:
+            session.status = 'failed'
+            session.last_error = f'Failed to exchange MyID code: {str(exc)[:200]}'
+            session.save(update_fields=['status', 'last_error', 'updated_at'])
+            return Response({
+                'session_id': session.session_id,
+                'status': session.status,
+                'error': session.last_error,
+            }, status=status.HTTP_502_BAD_GATEWAY)
+
+        profile_data = _myid_profile_values(myid_data)
+        session_data = session.myid_payload if isinstance(session.myid_payload, dict) else {}
+        flow = str(session_data.get('flow') or 'login').strip().lower()
+
+        phone = profile_data.get('phone') or session.phone or request.data.get('phone') or ''
+        email = profile_data.get('email') or session.email or request.data.get('email') or ''
+        first_name = profile_data.get('first_name') or session_data.get('first_name') or ''
+        last_name = profile_data.get('last_name') or session_data.get('last_name') or ''
+        if not phone and not email:
+            session.status = 'failed'
+            session.last_error = 'MyID did not return a phone or email to match the B1 account.'
+            session.save(update_fields=['status', 'last_error', 'updated_at'])
+            return Response({
+                'session_id': session.session_id,
+                'status': session.status,
+                'error': session.last_error,
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        passport = profile_data.get('passport', '').upper()
+        birth_date_str = profile_data.get('birth_date', '')
+
+        if flow == 'login':
+            user = _user_identity_lookup(phone=phone, email=email)
+            if user is None:
+                session.status = 'failed'
+                session.last_error = 'No B1 account matches the verified MyID identity. Register first.'
+                session.save(update_fields=['status', 'last_error', 'updated_at'])
+                return Response({
+                    'session_id': session.session_id,
+                    'status': session.status,
+                    'error': session.last_error,
+                }, status=status.HTTP_404_NOT_FOUND)
+            profile, _ = UserProfile.objects.get_or_create(user=user)
+        else:
+            user, profile = _get_or_create_myid_user(
+                phone=phone,
+                email=email,
+                first_name=first_name,
+                last_name=last_name,
+                password_hash=str(session_data.get('password_hash') or ''),
+            )
+
+        if passport:
+            profile.passport = passport
+        if birth_date_str:
+            try:
+                profile.birth_date = date.fromisoformat(str(birth_date_str))
+            except Exception:
+                pass
+        profile.pinfl = profile_data.get('pinfl', '')
+        profile.myid_status = 'verified'
+        profile.save()
+
+        payload = {
+            'result_code': result_code,
+            'verified': True,
+            'phone': phone,
+            'email': email,
+            'first_name': first_name,
+            'last_name': last_name,
+            'passport': passport,
+            'birth_date': birth_date_str,
+            'pinfl': profile_data.get('pinfl', ''),
+            'comparison_value': myid_data.get('comparison_value', 0.0),
+            'raw': myid_data,
+        }
+        session.user = user
+        session.status = 'verified'
+        session.verified_at = timezone.now()
+        session.last_error = ''
+        session.phone = phone or session.phone
+        session.email = email or session.email
+        session.myid_payload = payload
+        session.save(update_fields=['user', 'status', 'verified_at', 'last_error', 'phone', 'email', 'myid_payload', 'updated_at'])
+
+        qr_session_id = str(request.data.get('qr_session_id') or '').strip()
+        if qr_session_id:
+            qr_session = AuthSession.objects.filter(session_id=qr_session_id, kind='web_qr').first()
+            if qr_session:
+                qr_session.user = user
+                qr_session.status = 'verified'
+                qr_session.verified_at = timezone.now()
+                qr_session.last_error = ''
+                qr_session.phone = phone or qr_session.phone
+                qr_session.email = email or qr_session.email
+                qr_session.save(update_fields=['user', 'status', 'verified_at', 'last_error', 'phone', 'email', 'updated_at'])
+
+        tokens = _issue_tokens(user)
+        profile_dict = {
+            'id': str(profile.id),
+            'phone': profile.phone,
+            'email': user.email,
+            'first_name': profile.first_name,
+            'last_name': profile.last_name,
+            'middle_name': profile.middle_name,
+            'passport': profile.passport,
+            'birth_date': str(profile.birth_date) if profile.birth_date else '',
+            'pinfl': profile.pinfl,
+            'myid_status': profile.myid_status,
+            'account_type': profile.account_type,
+        }
+        return Response({
+            'session_id': session.session_id,
+            'status': session.status,
+            'tokens': tokens,
+            'profile': profile_dict,
+            'qr_session_id': qr_session_id or '',
+        }, status=status.HTTP_200_OK)
+
+
+
+class PhoneLoginView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        phone = request.data.get('phone', '').strip()
+        password = request.data.get('password', '')
+
+        if not phone or not password:
+            return Response({
+                'error': 'Phone and password are required'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Find user by phone
+        user = _user_identity_lookup(phone=phone)
+
+        if not user:
+            return Response({
+                'error': 'No active account found with the given credentials'
+            }, status=status.HTTP_401_UNAUTHORIZED)
+
+        # Check password
+        if not user.check_password(password):
+            return Response({
+                'error': 'No active account found with the given credentials'
+            }, status=status.HTTP_401_UNAUTHORIZED)
+
+        # Generate tokens
+        tokens = _issue_tokens(user)
+
+        # Get profile info
+        profile = UserProfile.objects.filter(user=user).first()
+
+        return Response({
+            'access': tokens['access'],
+            'refresh': tokens['refresh'],
+            'user': {
+                'id': user.id,
+                'phone': profile.phone if profile else '',
+                'email': user.email,
+                'first_name': user.first_name,
+                'last_name': user.last_name,
+            }
+        }, status=status.HTTP_200_OK)
+
+
+class RegisterView(APIView):
+    def post(self, request):
+        myid_session_id = request.data.get('myid_session_id')
+        payme_connect_value = request.data.get('payme_connect')
+        if payme_connect_value is None:
+            payme_connect = False
+        else:
+            payme_connect = payme_connect_value is True or str(payme_connect_value).lower() in ['1', 'true', 'yes', 'on']
+        
+        allow_without_myid = get_config('ALLOW_REGISTER_WITHOUT_MYID', 'true').lower() in ['1', 'true', 'yes']
+        allow_without_phone_sms = get_config('ALLOW_REGISTER_WITHOUT_PHONE_SMS', 'true').lower() in ['1', 'true', 'yes']
+        
+        kyc = None
+        if myid_session_id:
+            kyc = KYCVerification.objects.filter(session_id=myid_session_id).first()
+            if kyc:
+                allow_without_myid = False
+                allow_without_phone_sms = False
+                
+        if not allow_without_myid and (not kyc or kyc.status not in ['verified', 'demo_verified']):
+            return Response({
+                "myid": "MyID verification is required before registration"
+            }, status=status.HTTP_400_BAD_REQUEST)
+        if not allow_without_phone_sms and kyc and not kyc.phone_verified:
+            return Response({
+                "phone_sms": "Phone SMS verification is required before registration"
+            }, status=status.HTTP_400_BAD_REQUEST)
+        if payme_connect and missing_payme_checkout_config():
+            return payme_config_error_response()
+
+        serializer = RegisterSerializer(data=request.data)
+        if serializer.is_valid():
+            user = serializer.save(
+                first_name=(kyc.first_name if kyc and kyc.first_name else request.data.get('first_name', '')),
+                last_name=(kyc.last_name if kyc and kyc.last_name else request.data.get('last_name', ''))
+            )
+            profile, _ = UserProfile.objects.get_or_create(
+                user=user,
+                defaults={'phone': request.data.get('phone', '')}
+            )
+            profile.phone = (kyc.phone if kyc and kyc.phone else request.data.get('phone', profile.phone))
+            if kyc:
+                profile.passport = kyc.passport
+                profile.birth_date = kyc.birth_date
+                profile.myid_status = kyc.status
+                profile.myid_job_id = kyc.job_id
+                profile.myid_session_id = kyc.session_id
+                profile.myid_payload = kyc.payload
+            profile.save()
+
+            from rest_framework_simplejwt.tokens import RefreshToken
+            refresh = RefreshToken.for_user(user)
+            tokens = {
+                "access": str(refresh.access_token),
+                "refresh": str(refresh),
+            }
+
+            response_data = {
+                "message": "User registered successfully",
+                "tokens": tokens,
+                "myid_status": profile.myid_status,
+            }
+
+            if payme_connect:
+                # Create a card_order order to link the profile and card
+                order = Order.objects.create(
+                    user=user,
+                    amount=Decimal('1000.00'),
+                    purpose='card_order',
+                    description='Регистрация и привязка профиля через Payme',
+                )
+                order.checkout_url = build_payme_checkout_url(order)
+                order.save(update_fields=['checkout_url'])
+                response_data['payme_checkout_url'] = order.checkout_url
+                response_data['payme_order_id'] = order.id
+                response_data['payme_amount_tiyin'] = int(order.amount * 100)
+
+            return Response(response_data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+
+class RegistrationMyIDStartView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        email = request.data.get('email', '').strip().lower()
+        passport = request.data.get('passport', '').strip().upper()
+        birth_date = request.data.get('birth_date', '')
+        phone = request.data.get('phone', '').strip()
+        agreed_value = request.data.get('agreed_on_terms')
+        agreed = agreed_value is True or str(agreed_value).lower() in ['1', 'true', 'yes', 'on']
+
+        if not email or not phone or not agreed:
+            return Response({
+                "detail": "email, phone and agreed_on_terms are required"
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        session_id = f"reg-myid-{uuid.uuid4()}"
+        external_id = str(uuid.uuid4())
+        photo_from_camera = request.data.get('photo_from_camera') or {}
+        payload = {
+            "first_name": request.data.get('first_name', ''),
+            "last_name": request.data.get('last_name', ''),
+            "phone": phone,
+            "pass_data": passport,
+            "birth_date": birth_date,
+            "photo_from_camera": photo_from_camera,
+            "agreed_on_terms": agreed,
+            "external_id": external_id,
+            "is_resident": request.data.get('is_resident', True),
+        }
+        has_inline_myid_data = bool(passport and birth_date and (photo_from_camera.get('front') or request.data.get('front')))
+
+        try:
+            if has_inline_myid_data:
+                myid = start_myid_authentication(payload)
+            elif myid_is_configured() and get_config('MYID_HOSTED_URL'):
+                hosted_url = get_config('MYID_HOSTED_URL')
+                myid = {
+                    'demo': False,
+                    'status': 'pending',
+                    'job_id': '',
+                    'external_id': external_id,
+                    'redirect_url': hosted_url,
+                    'payload': {
+                        'source': 'hosted_redirect',
+                        'redirect_url': hosted_url,
+                    },
+                }
+            elif myid_is_configured():
+                return Response({
+                    "detail": "This MyID mode needs a hosted/redirect URL or inline passport, birth date and face photo data."
+                }, status=status.HTTP_400_BAD_REQUEST)
+            else:
+                myid = {
+                    'demo': True,
+                    'status': 'demo_verified',
+                    'job_id': f"myid-demo-{int(time.time())}",
+                    'external_id': external_id,
+                    'payload': {
+                        'first_name': payload["first_name"],
+                        'last_name': payload["last_name"],
+                        'phone': phone,
+                        'source': 'demo_redirect',
+                    },
+                }
+            kyc = KYCVerification.objects.create(
+                session_id=session_id,
+                email=email,
+                phone=phone,
+                first_name=payload["first_name"],
+                last_name=payload["last_name"],
+                passport=passport,
+                birth_date=birth_date or None,
+                status=myid.get('status', 'pending'),
+                job_id=myid.get('job_id', ''),
+                external_id=myid.get('external_id', external_id),
+                payload=myid.get('payload', {}),
+                verified_at=timezone.now() if myid.get('status') in ['verified', 'demo_verified'] else None,
+            )
+        except Exception as exc:
+            kyc = KYCVerification.objects.create(
+                session_id=session_id,
+                email=email,
+                phone=phone,
+                first_name=payload["first_name"],
+                last_name=payload["last_name"],
+                passport=passport,
+                birth_date=birth_date or None,
+                status='failed',
+                external_id=external_id,
+                error=str(exc),
+            )
+            return Response({
+                "session_id": kyc.session_id,
+                "status": kyc.status,
+                "error": kyc.error,
+            }, status=status.HTTP_502_BAD_GATEWAY)
+
+        return Response({
+            "session_id": kyc.session_id,
+            "status": kyc.status,
+            "job_id": kyc.job_id,
+            "external_id": kyc.external_id,
+            "redirect_url": myid.get('redirect_url', ''),
+            "demo": kyc.status == 'demo_verified',
+        }, status=status.HTTP_201_CREATED)
+
+
+class RegistrationMyIDStatusView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        session_id = request.data.get('session_id')
+        kyc = KYCVerification.objects.filter(session_id=session_id).first()
+        if not kyc:
+            return Response({"detail": "KYC session not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        if kyc.status in ['verified', 'demo_verified', 'failed']:
+            return Response({
+                "session_id": kyc.session_id,
+                "status": kyc.status,
+                "payload": kyc.payload,
+                "error": kyc.error,
+            })
+
+        try:
+            result = get_myid_status(kyc.job_id)
+            kyc.status = result.get('status', 'verified')
+            kyc.payload = {**(kyc.payload or {}), "status_response": result.get('payload', {})}
+            kyc.verified_at = timezone.now()
+            kyc.save(update_fields=['status', 'payload', 'verified_at'])
+        except Exception as exc:
+            kyc.error = str(exc)
+            kyc.save(update_fields=['error'])
+
+        return Response({
+            "session_id": kyc.session_id,
+            "status": kyc.status,
+            "payload": kyc.payload,
+            "error": kyc.error,
+        })
+
+
+class RegistrationPhoneCodeView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        session_id = request.data.get('session_id')
+        kyc = KYCVerification.objects.filter(session_id=session_id).first()
+        if not kyc:
+            return Response({"detail": "KYC session not found"}, status=status.HTTP_404_NOT_FOUND)
+        if kyc.status not in ['verified', 'demo_verified']:
+            return Response({"detail": "MyID verification must be completed first"}, status=status.HTTP_400_BAD_REQUEST)
+        if not kyc.phone:
+            return Response({"detail": "Phone is missing for this session"}, status=status.HTTP_400_BAD_REQUEST)
+
+        code = generate_sms_code()
+        sms = send_registration_sms(kyc.phone, code)
+        kyc.sms_code = code
+        kyc.sms_sent_at = timezone.now()
+        kyc.payload = {
+            **(kyc.payload or {}),
+            "phone_sms": {
+                "sent": bool(sms.get('sent')),
+                "demo": bool(sms.get('demo')),
+                "phone": sms.get('phone') or mask_phone(kyc.phone),
+            }
+        }
+        kyc.save(update_fields=['sms_code', 'sms_sent_at', 'payload'])
+
+        return Response({
+            "session_id": kyc.session_id,
+            "sent": bool(sms.get('sent')),
+            "phone": sms.get('phone') or mask_phone(kyc.phone),
+            "wait": sms.get('wait', 60000),
+            "demo": bool(sms.get('demo')),
+        })
+
+
+class RegistrationPhoneVerifyView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        session_id = request.data.get('session_id')
+        code = str(request.data.get('code', '')).strip()
+        kyc = KYCVerification.objects.filter(session_id=session_id).first()
+        if not kyc:
+            return Response({"detail": "KYC session not found"}, status=status.HTTP_404_NOT_FOUND)
+        if not code:
+            return Response({"detail": "SMS code is required"}, status=status.HTTP_400_BAD_REQUEST)
+        if not kyc.sms_code or code != kyc.sms_code:
+            return Response({"detail": "Invalid SMS code"}, status=status.HTTP_400_BAD_REQUEST)
+
+        kyc.phone_verified = True
+        kyc.sms_verified_at = timezone.now()
+        kyc.payload = {**(kyc.payload or {}), "phone_verified": True}
+        kyc.save(update_fields=['phone_verified', 'sms_verified_at', 'payload'])
+        return Response({
+            "session_id": kyc.session_id,
+            "phone_verified": True,
+            "phone": mask_phone(kyc.phone),
+        })
+
+class ProfileView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        profile, created = UserProfile.objects.get_or_create(user=user)
+        return Response({
+            "id": user.id,
+            "email": user.email,
+            "first_name": user.first_name if user.first_name else "",
+            "last_name": user.last_name if user.last_name else "",
+            "phone": profile.phone if profile.phone else "",
+            "passport": profile.passport if profile.passport else "",
+            "birth_date": profile.birth_date.isoformat() if profile.birth_date else "",
+            "myid_status": profile.myid_status,
+            "credits": float(profile.credits),
+            "investments": float(profile.investments),
+            "savings": float(profile.savings),
+            "date_joined": user.date_joined.strftime('%Y-%m-%d')
+        })
+
+    def put(self, request):
+        user = request.user
+        data = request.data
+        user.first_name = data.get('first_name', user.first_name)
+        user.last_name = data.get('last_name', user.last_name)
+        if 'email' in data:
+            user.email = data.get('email')
+            user.username = data.get('email')
+        user.save()
+
+        profile, created = UserProfile.objects.get_or_create(user=user)
+        profile.phone = data.get('phone', profile.phone)
+        if 'credits' in data:
+            profile.credits = data.get('credits')
+        if 'investments' in data:
+            profile.investments = data.get('investments')
+        if 'savings' in data:
+            profile.savings = data.get('savings')
+        profile.save()
+
+        return Response({
+            "message": "Profile updated successfully",
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+            "email": user.email,
+            "phone": profile.phone,
+            "credits": float(profile.credits),
+            "investments": float(profile.investments),
+            "savings": float(profile.savings),
+        })
+
+class CardListView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        cards = Card.objects.filter(user=request.user)
+        serializer = CardSerializer(cards, many=True)
+        return Response(serializer.data)
+
+    def post(self, request):
+        serializer = CardSerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save(user=request.user)
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class CardDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def delete(self, request, pk):
+        try:
+            card = Card.objects.get(pk=pk, user=request.user)
+            card.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        except Card.DoesNotExist:
+            return Response({"error": "Card not found"}, status=status.HTTP_404_NOT_FOUND)
+
+
+class OctoP2PTransferView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        transfers = P2PTransfer.objects.filter(user=request.user).order_by('-created_at')[:50]
+        return Response(P2PTransferSerializer(transfers, many=True).data)
+
+    def post(self, request):
+        serializer = P2PTransferCreateSerializer(data=request.data, context={'request': request})
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        source_card = serializer.validated_data.get('source_card_id')
+        recipient = serializer.validated_data['recipient']
+        transfer = P2PTransfer.objects.create(
+            user=request.user,
+            source_card=source_card,
+            source_card_mask=mask_card_or_phone(source_card.number) if source_card else '',
+            recipient_mask=mask_card_or_phone(recipient),
+            recipient_type=recipient_type_for(recipient),
+            amount=serializer.validated_data['amount'],
+            currency=serializer.validated_data.get('currency', 'UZS'),
+            note=serializer.validated_data.get('note', ''),
+        )
+
+        try:
+            provider_result = submit_octo_p2p_transfer(transfer, recipient, source_card)
+        except Exception as exc:
+            transfer.status = 'failed'
+            transfer.provider_status = 'request_error'
+            transfer.error_message = str(exc)[:500]
+            transfer.provider_payload = {'error': str(exc)[:500]}
+            transfer.save(update_fields=['status', 'provider_status', 'error_message', 'provider_payload', 'updated_at'])
+            return Response(P2PTransferSerializer(transfer).data, status=status.HTTP_502_BAD_GATEWAY)
+
+        transfer.status = provider_result.get('status') or 'provider_not_connected'
+        transfer.provider_status = provider_result.get('provider_status', '')
+        transfer.provider_reference = provider_result.get('provider_reference', '')
+        transfer.provider_payload = provider_result.get('payload', {})
+        transfer.error_message = provider_result.get('message', '')
+        transfer.save(update_fields=[
+            'status',
+            'provider_status',
+            'provider_reference',
+            'provider_payload',
+            'error_message',
+            'updated_at',
+        ])
+
+        response_status = status.HTTP_201_CREATED if provider_result.get('sent') else status.HTTP_202_ACCEPTED
+        return Response(P2PTransferSerializer(transfer).data, status=response_status)
+
+
+class PaymeSubscribeCardCreateView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        number = ''.join(ch for ch in str(request.data.get('number', '')) if ch.isdigit())
+        expire = ''.join(ch for ch in str(request.data.get('expire', '')) if ch.isdigit())
+        if len(number) < 16 or len(expire) != 4:
+            return Response({"detail": "Card number and expire MMYY are required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        response = payme_subscribe_rpc('cards.create', {
+            'card': {'number': number, 'expire': expire},
+            'save': bool(request.data.get('save', True)),
+            'customer': request.user.email,
+        })
+        return Response(response)
+
+
+class PaymeSubscribeCardCodeView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        token = request.data.get('token')
+        if not token:
+            return Response({"detail": "token is required"}, status=status.HTTP_400_BAD_REQUEST)
+        response = payme_subscribe_rpc('cards.get_verify_code', {'token': token})
+        profile, _ = UserProfile.objects.get_or_create(user=request.user)
+        registered_phone = mask_phone(profile.phone or '')
+        result = response.setdefault('result', {})
+        result['registered_phone'] = registered_phone
+        if response.get('result', {}).get('phone') in [None, '', '99890*****00'] and registered_phone:
+            result['phone'] = registered_phone
+        return Response(response)
+
+
+class PaymeSubscribeCardVerifyView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        token = request.data.get('token')
+        code = request.data.get('code')
+        if not token or not code:
+            return Response({"detail": "token and code are required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        response = payme_subscribe_rpc('cards.verify', {
+            'token': token,
+            'code': code,
+            'number': request.data.get('number', ''),
+            'expire': request.data.get('expire', ''),
+        })
+        card_payload = response.get('result', {}).get('card', {})
+        if not card_payload or not card_payload.get('verify'):
+            return Response(response, status=status.HTTP_400_BAD_REQUEST)
+
+        card, _ = Card.objects.update_or_create(
+            user=request.user,
+            payme_token=card_payload.get('token', token),
+            defaults={
+                'number': card_payload.get('number', '860000******0000'),
+                'expiry': card_payload.get('expire', request.data.get('expire', '')),
+                'balance': 0,
+                'name': request.data.get('name') or 'Payme',
+                'provider': 'payme',
+                'payme_recurrent': bool(card_payload.get('recurrent', True)),
+                'payme_verified': bool(card_payload.get('verify', True)),
+                'payme_payload': card_payload,
+            }
+        )
+        return Response({
+            "payme": response,
+            "card": CardSerializer(card).data,
+        }, status=status.HTTP_201_CREATED)
+
+
+class PaymeSubscribeReceiptView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        method = request.data.get('method', 'receipts.create')
+        params = request.data.get('params', {})
+        if method not in ['receipts.create', 'receipts.pay', 'receipts.check', 'receipts.get', 'receipts.cancel']:
+            return Response({"detail": "Unsupported receipt method"}, status=status.HTTP_400_BAD_REQUEST)
+        response = payme_subscribe_rpc(method, params, backend=True)
+        return Response(response)
+
+
+class PaymeCreateOrderView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        if missing_payme_checkout_config():
+            return payme_config_error_response()
+
+        amount = request.data.get('amount')
+        purpose = request.data.get('purpose', 'application')
+        target_id = request.data.get('target_id', '')
+        description = request.data.get('description', '')
+
+        try:
+            amount_decimal = Decimal(str(amount))
+        except Exception:
+            return Response({"amount": "Invalid amount"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if amount_decimal < PAYME_MIN_ORDER_AMOUNT_UZS or amount_decimal > PAYME_MAX_ORDER_AMOUNT_UZS:
+            return Response({
+                "amount": f"Amount must be between {PAYME_MIN_ORDER_AMOUNT_UZS} and {PAYME_MAX_ORDER_AMOUNT_UZS} UZS",
+                "min_amount": str(PAYME_MIN_ORDER_AMOUNT_UZS),
+                "max_amount": str(PAYME_MAX_ORDER_AMOUNT_UZS),
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        allowed_purposes = {choice[0] for choice in Order.PURPOSE_CHOICES}
+        if purpose not in allowed_purposes:
+            purpose = 'application'
+
+        order = Order.objects.create(
+            user=request.user,
+            amount=amount_decimal,
+            purpose=purpose,
+            target_id=str(target_id) if target_id is not None else '',
+            description=description[:255] if description else '',
+        )
+        order.checkout_url = build_payme_checkout_url(order)
+        order.save(update_fields=['checkout_url'])
+
+        if purpose == 'investment':
+            startup = None
+            if target_id and str(target_id).isdigit():
+                startup = Startup.objects.filter(id=target_id).first()
+            investment_amount = amount_decimal
+            if request.data.get('display_amount') not in [None, '']:
+                try:
+                    investment_amount = Decimal(str(request.data.get('display_amount')))
+                except Exception:
+                    investment_amount = amount_decimal
+            Investment.objects.create(
+                investor=request.user,
+                startup=startup,
+                order=order,
+                amount=investment_amount,
+                comment=request.data.get('comment', ''),
+            )
+
+        return Response(OrderSerializer(order).data, status=status.HTTP_201_CREATED)
+
+
+class LegalEntityProfileView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        profile = LegalEntityProfile.objects.filter(user=request.user).first()
+        if not profile:
+            return Response({"detail": "Legal entity profile not created"}, status=status.HTTP_404_NOT_FOUND)
+        return Response(LegalEntityProfileSerializer(profile).data)
+
+    def post(self, request):
+        profile = LegalEntityProfile.objects.filter(user=request.user).first()
+        serializer = LegalEntityProfileSerializer(profile, data=request.data, partial=bool(profile))
+        if serializer.is_valid():
+            legal_profile = serializer.save(user=request.user)
+            return Response(LegalEntityProfileSerializer(legal_profile).data, status=status.HTTP_200_OK if profile else status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    def put(self, request):
+        return self.post(request)
+
+
+class LegalEntitySubmitView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        profile = LegalEntityProfile.objects.filter(user=request.user).first()
+        if not profile:
+            return Response({"detail": "Legal entity profile not created"}, status=status.HTTP_404_NOT_FOUND)
+
+        missing = []
+        for field in ['company_name', 'tin', 'registration_number', 'director_name', 'director_passport']:
+            if not getattr(profile, field):
+                missing.append(field)
+        if not profile.accepted_terms or not profile.accepted_investment_risk:
+            missing.append('agreements')
+        if profile.myid_status not in ['verified', 'demo_verified']:
+            missing.append('myid')
+        if not profile.company_docs:
+            missing.append('company_docs')
+
+        if missing:
+            return Response({"detail": "Profile is incomplete", "missing": missing}, status=status.HTTP_400_BAD_REQUEST)
+
+        profile.status = 'pending_review'
+        profile.submitted_at = timezone.now()
+        profile.save(update_fields=['status', 'submitted_at', 'updated_at'])
+        return Response(LegalEntityProfileSerializer(profile).data)
+
+
+class MyIDStartView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        profile, _ = LegalEntityProfile.objects.get_or_create(
+            user=request.user,
+            defaults={'company_name': request.data.get('company_name', request.user.email or 'Company')}
+        )
+        session_id = f"myid-demo-{request.user.id}-{int(time.time())}"
+        profile.director_passport = request.data.get('passport', profile.director_passport)
+        profile.director_birth_date = request.data.get('birth_date') or profile.director_birth_date
+        profile.myid_status = 'pending'
+        profile.myid_session_id = session_id
+        profile.myid_payload = {
+            "mode": "demo" if not get_config('MYID_CLIENT_ID') else "api_ready",
+            "passport": profile.director_passport,
+            "birth_date": str(profile.director_birth_date) if profile.director_birth_date else request.data.get('birth_date', ''),
+        }
+        profile.save()
+
+        return Response({
+            "session_id": session_id,
+            "status": profile.myid_status,
+            "verification_url": get_config('MYID_VERIFICATION_URL', ''),
+            "demo": not bool(get_config('MYID_CLIENT_ID')),
+            "message": "MYID credentials are not configured; demo verification can be completed from frontend." if not get_config('MYID_CLIENT_ID') else "MYID session prepared.",
+        })
+
+
+class MyIDCompleteView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        profile = LegalEntityProfile.objects.filter(user=request.user).first()
+        if not profile:
+            return Response({"detail": "Legal entity profile not created"}, status=status.HTTP_404_NOT_FOUND)
+
+        profile.myid_status = 'demo_verified' if not get_config('MYID_CLIENT_ID') else 'verified'
+        profile.verified_at = timezone.now()
+        profile.myid_payload = {
+            **(profile.myid_payload or {}),
+            "face_photo_received": bool(request.data.get('face_photo')),
+            "verified_at": profile.verified_at.isoformat(),
+        }
+        profile.save(update_fields=['myid_status', 'verified_at', 'myid_payload', 'updated_at'])
+        return Response(LegalEntityProfileSerializer(profile).data)
+
+
+class StartupListCreateView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        mine = request.query_params.get('mine') == '1'
+        if mine and not request.user.is_authenticated:
+            return Response({"detail": "Authentication credentials were not provided."}, status=status.HTTP_401_UNAUTHORIZED)
+        queryset = Startup.objects.select_related('legal_entity', 'owner').all()
+        if mine:
+            queryset = queryset.filter(owner=request.user)
+        else:
+            queryset = queryset.filter(status='active')
+        serializer = StartupSerializer if mine else StartupPublicSerializer
+        return Response(serializer(queryset.order_by('-created_at'), many=True).data)
+
+    def post(self, request):
+        if not request.user.is_authenticated:
+            return Response({"detail": "Authentication credentials were not provided."}, status=status.HTTP_401_UNAUTHORIZED)
+        legal_profile = LegalEntityProfile.objects.filter(user=request.user).first()
+        if not legal_profile:
+            return Response({"detail": "Create legal entity profile first"}, status=status.HTTP_400_BAD_REQUEST)
+        if legal_profile.status != 'verified':
+            return Response({"detail": "Legal entity must pass verification before publishing startups"}, status=status.HTTP_400_BAD_REQUEST)
+
+        serializer = StartupSerializer(data=request.data)
+        if serializer.is_valid():
+            startup = serializer.save(
+                owner=request.user,
+                legal_entity=legal_profile,
+                contact_email=request.data.get('contact_email') or request.user.email,
+            )
+            return Response(StartupSerializer(startup).data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class StartupDetailView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, pk):
+        queryset = Startup.objects.select_related('legal_entity', 'owner').filter(pk=pk)
+        if request.user.is_authenticated:
+            queryset = queryset.filter(Q(status='active') | Q(owner=request.user))
+        else:
+            queryset = queryset.filter(status='active')
+        startup = queryset.first()
+        if not startup:
+            return Response({"detail": "Startup not found"}, status=status.HTTP_404_NOT_FOUND)
+        serializer = StartupSerializer if request.user.is_authenticated and startup.owner_id == request.user.id else StartupPublicSerializer
+        return Response(serializer(startup).data)
+
+
+class InvestmentListCreateView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        investments = Investment.objects.filter(investor=request.user).select_related('startup', 'order')
+        return Response(InvestmentSerializer(investments.order_by('-created_at'), many=True).data)
+
+    def post(self, request):
+        if missing_payme_checkout_config():
+            return payme_config_error_response()
+
+        startup = Startup.objects.filter(pk=request.data.get('startup'), status='active').first()
+        if not startup:
+            return Response({"startup": "Startup not found"}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            amount = Decimal(str(request.data.get('amount', startup.min_investment)))
+        except Exception:
+            return Response({"amount": "Invalid amount"}, status=status.HTTP_400_BAD_REQUEST)
+        if amount < startup.min_investment:
+            return Response({
+                "amount": f"Minimum investment is {startup.min_investment}",
+                "min_investment": str(startup.min_investment),
+            }, status=status.HTTP_400_BAD_REQUEST)
+        order = Order.objects.create(
+            user=request.user,
+            amount=amount,
+            purpose='investment',
+            target_id=str(startup.id),
+            description=f"Investment in {startup.name}",
+        )
+        order.checkout_url = build_payme_checkout_url(order)
+        order.save(update_fields=['checkout_url'])
+        investment = Investment.objects.create(
+            investor=request.user,
+            startup=startup,
+            order=order,
+            amount=amount,
+            comment=request.data.get('comment', ''),
+        )
+        return Response(InvestmentSerializer(investment).data, status=status.HTTP_201_CREATED)
+
+
+class ApplicationCreateView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        if request.data.get('amount') and missing_payme_checkout_config():
+            return payme_config_error_response()
+
+        order = None
+        amount = request.data.get('amount')
+        if amount:
+            order = Order.objects.create(
+                user=request.user,
+                amount=Decimal(str(amount)),
+                purpose='application',
+                target_id=str(request.data.get('target_id', '')),
+                description=request.data.get('app_type', 'application')[:255],
+            )
+            order.checkout_url = build_payme_checkout_url(order)
+            order.save(update_fields=['checkout_url'])
+        return Response({
+            "message": "Application accepted",
+            "order": OrderSerializer(order).data if order else None,
+        }, status=status.HTTP_201_CREATED)
+
+
+class UserOrdersView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        orders = Order.objects.filter(user=request.user).order_by('-created_at')
+        return Response(OrderSerializer(orders, many=True).data)
+
+
+
+import openpyxl
+from django.http import HttpResponse
+
+def download_financial_report(request):
+    user = request.user
+    profile = user.profile
+    
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Financial Report"
+    
+    # Заголовки
+    ws.append(['Kategoriya', 'Summa (UZS)'])
+    ws.append(['Jamg\'armalar', profile.savings])
+    ws.append(['Investitsiyalar', profile.investments])
+    ws.append(['Kreditlar', profile.credits])
+    
+    response = HttpResponse(content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    response['Content-Disposition'] = 'attachment; filename=report.xlsx'
+    wb.save(response)
+    return response

@@ -1,0 +1,452 @@
+import uuid
+
+from django.db import models
+from django.contrib.auth.models import User
+from django.utils import timezone
+
+class UserProfile(models.Model):
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='profile')
+    phone = models.CharField(max_length=20, blank=True, null=True)
+    passport = models.CharField(max_length=20, blank=True, null=True)
+    birth_date = models.DateField(blank=True, null=True)
+    myid_status = models.CharField(max_length=32, default='not_started')
+    myid_job_id = models.CharField(max_length=120, blank=True, null=True)
+    myid_session_id = models.CharField(max_length=120, blank=True, null=True)
+    myid_payload = models.JSONField(default=dict, blank=True)
+    credits = models.DecimalField(max_digits=15, decimal_places=2, default=0.0)
+    investments = models.DecimalField(max_digits=15, decimal_places=2, default=0.0)
+    savings = models.DecimalField(max_digits=15, decimal_places=2, default=0.0)
+
+    def __str__(self):
+        return f"Profile of {self.user.username}"
+
+
+class Card(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='cards')
+    number = models.CharField(max_length=20)
+    expiry = models.CharField(max_length=5)
+    balance = models.DecimalField(max_digits=15, decimal_places=2, default=0.0)
+    name = models.CharField(max_length=50, blank=True, null=True)
+    provider = models.CharField(max_length=30, blank=True, default='manual')
+    payme_token = models.TextField(blank=True, null=True)
+    payme_recurrent = models.BooleanField(default=False)
+    payme_verified = models.BooleanField(default=False)
+    payme_payload = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.name or 'Card'} — {self.number} ({self.balance} UZS)"
+
+
+class KYCVerification(models.Model):
+    STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('verified', 'Verified'),
+        ('demo_verified', 'Demo verified'),
+        ('failed', 'Failed'),
+    ]
+    session_id = models.CharField(max_length=120, unique=True)
+    email = models.EmailField()
+    phone = models.CharField(max_length=30, blank=True)
+    first_name = models.CharField(max_length=120, blank=True)
+    last_name = models.CharField(max_length=120, blank=True)
+    passport = models.CharField(max_length=20, blank=True)
+    birth_date = models.DateField(blank=True, null=True)
+    status = models.CharField(max_length=32, choices=STATUS_CHOICES, default='pending')
+    job_id = models.CharField(max_length=120, blank=True)
+    external_id = models.CharField(max_length=120, blank=True)
+    phone_verified = models.BooleanField(default=False)
+    sms_code = models.CharField(max_length=12, blank=True)
+    sms_sent_at = models.DateTimeField(blank=True, null=True)
+    sms_verified_at = models.DateTimeField(blank=True, null=True)
+    payload = models.JSONField(default=dict, blank=True)
+    error = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    verified_at = models.DateTimeField(blank=True, null=True)
+
+    def __str__(self):
+        return f"{self.email} ({self.status})"
+
+
+class AuthSession(models.Model):
+    KIND_CHOICES = [
+        ('web_qr', 'Web QR login'),
+        ('myid_mobile', 'MyID mobile login'),
+        ('myid_web', 'MyID web redirect login'),
+    ]
+    STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('verified', 'Verified'),
+        ('failed', 'Failed'),
+        ('expired', 'Expired'),
+    ]
+
+    session_id = models.CharField(max_length=120, unique=True)
+    kind = models.CharField(max_length=24, choices=KIND_CHOICES)
+    status = models.CharField(max_length=24, choices=STATUS_CHOICES, default='pending')
+    user = models.ForeignKey(User, on_delete=models.SET_NULL, related_name='auth_sessions', null=True, blank=True)
+    phone = models.CharField(max_length=30, blank=True, default='')
+    email = models.EmailField(blank=True, default='')
+    account_type = models.CharField(max_length=20, blank=True, default='physical')
+    qr_payload = models.TextField(blank=True, default='')
+    myid_session_id = models.CharField(max_length=120, blank=True, default='')
+    myid_payload = models.JSONField(default=dict, blank=True)
+    verified_at = models.DateTimeField(blank=True, null=True)
+    expires_at = models.DateTimeField()
+    last_error = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.kind} {self.session_id} ({self.status})"
+
+
+class RequestLog(models.Model):
+    """Redacted HTTP request/response audit entry for the admin console."""
+
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    request_id = models.CharField(max_length=40, blank=True, default='', db_index=True)
+    method = models.CharField(max_length=12)
+    path = models.CharField(max_length=500)
+    status_code = models.PositiveSmallIntegerField(null=True, blank=True, db_index=True)
+    duration_ms = models.PositiveIntegerField(null=True, blank=True)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='request_logs')
+    username = models.CharField(max_length=150, blank=True, default='')
+    user_agent = models.CharField(max_length=500, blank=True, default='')
+    query_params = models.JSONField(default=dict, blank=True)
+    request_body = models.JSONField(default=dict, blank=True)
+    response_summary = models.CharField(max_length=300, blank=True, default='')
+    error = models.TextField(blank=True, default='')
+
+    class Meta:
+        ordering = ('-created_at',)
+        indexes = [
+            models.Index(fields=('created_at', 'status_code')),
+            models.Index(fields=('path', 'created_at')),
+        ]
+
+    def __str__(self):
+        return f"{self.method} {self.path} → {self.status_code or 'error'}"
+
+
+class Order(models.Model):
+    STATUS_CHOICES = [
+        ('pending', 'Ожидает оплаты'),
+        ('paid', 'Оплачен'),
+        ('canceled', 'Отменен'),
+    ]
+    PURPOSE_CHOICES = [
+        ('card_order', 'Заказ карты'),
+        ('investment', 'Инвестиция'),
+        ('transfer', 'Перевод средств'),
+        ('loan_application', 'Заявка на кредит'),
+        ('application', 'Заявка'),
+        ('report', 'Финансовый отчет'),
+    ]
+    user = models.ForeignKey(User, on_delete=models.SET_NULL, related_name='orders', null=True, blank=True)
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    purpose = models.CharField(max_length=32, choices=PURPOSE_CHOICES, default='application')
+    target_id = models.CharField(max_length=80, blank=True, null=True)
+    description = models.CharField(max_length=255, blank=True, null=True)
+    checkout_url = models.TextField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"Заказ #{self.id} — {self.amount} сум ({self.purpose})"
+
+
+class PaymeTransaction(models.Model):
+    payme_id = models.CharField(max_length=255, unique=True)
+    order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name='transactions')
+    amount = models.BigIntegerField()
+    state = models.IntegerField()
+    create_time = models.BigIntegerField()
+    perform_time = models.BigIntegerField(default=0)
+    cancel_time = models.BigIntegerField(default=0)
+    reason = models.IntegerField(null=True, blank=True)
+
+    def __str__(self):
+        return f"Транзакция Payme {self.payme_id} (Cтатус: {self.state})"
+
+
+class P2PTransfer(models.Model):
+    STATUS_CHOICES = [
+        ('draft', 'Черновик'),
+        ('provider_not_connected', 'Провайдер не подключен'),
+        ('pending', 'В обработке'),
+        ('success', 'Успешно'),
+        ('failed', 'Ошибка'),
+        ('canceled', 'Отменено'),
+    ]
+    RECIPIENT_TYPE_CHOICES = [
+        ('card', 'Карта'),
+        ('phone', 'Телефон'),
+        ('unknown', 'Неизвестно'),
+    ]
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='p2p_transfers')
+    source_card = models.ForeignKey(Card, on_delete=models.SET_NULL, null=True, blank=True, related_name='outgoing_transfers')
+    source_card_mask = models.CharField(max_length=32, blank=True, default='')
+    recipient_mask = models.CharField(max_length=32)
+    recipient_type = models.CharField(max_length=12, choices=RECIPIENT_TYPE_CHOICES, default='unknown')
+    amount = models.DecimalField(max_digits=15, decimal_places=2)
+    currency = models.CharField(max_length=3, default='UZS')
+    provider = models.CharField(max_length=30, default='octo')
+    status = models.CharField(max_length=32, choices=STATUS_CHOICES, default='provider_not_connected')
+    shop_transaction_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    provider_reference = models.CharField(max_length=120, blank=True, default='')
+    provider_status = models.CharField(max_length=60, blank=True, default='')
+    provider_payload = models.JSONField(default=dict, blank=True)
+    error_message = models.TextField(blank=True, default='')
+    note = models.CharField(max_length=180, blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ('-created_at',)
+        indexes = [
+            models.Index(fields=('user', '-created_at')),
+            models.Index(fields=('status', '-created_at')),
+        ]
+
+    def __str__(self):
+        return f"P2P {self.provider} #{self.id or 'new'} — {self.amount} {self.currency} ({self.status})"
+
+
+
+from django.db import models
+from django.contrib.auth.models import User
+
+# Модель Банка
+class Bank(models.Model):
+    name = models.CharField(max_length=100)
+    abbr = models.CharField(max_length=10) # Например: NBU, KB
+    logo_url = models.CharField(max_length=255) # Ссылка на лого
+    apy = models.FloatField(default=0.0) # Процентная ставка
+    min_deposit = models.DecimalField(max_digits=15, decimal_places=2)
+    rating = models.FloatField(default=5.0)
+    is_recommended = models.BooleanField(default=False)
+    is_catalog = models.BooleanField(default=False)
+    slug = models.SlugField(max_length=140, blank=True, default='')
+    legal_name = models.CharField(max_length=220, blank=True, default='')
+    name_uz = models.CharField(max_length=140, blank=True, default='')
+    description = models.TextField(blank=True, default='')
+    description_uz = models.TextField(blank=True, default='')
+    ownership_type = models.CharField(max_length=40, blank=True, default='')
+    license_number = models.CharField(max_length=40, blank=True, default='')
+    license_date = models.DateField(blank=True, null=True)
+    website_url = models.URLField(blank=True, default='')
+    support_phone = models.CharField(max_length=80, blank=True, default='')
+    support_email = models.EmailField(blank=True, default='')
+    address = models.CharField(max_length=300, blank=True, default='')
+    stir = models.CharField(max_length=32, blank=True, default='')
+    swift_code = models.CharField(max_length=32, blank=True, default='')
+    bank_code = models.CharField(max_length=32, blank=True, default='')
+    mobile_app_url = models.URLField(blank=True, default='')
+    android_url = models.URLField(blank=True, default='')
+    ios_url = models.URLField(blank=True, default='')
+    products = models.JSONField(default=list, blank=True)
+    services = models.JSONField(default=list, blank=True)
+    source_urls = models.JSONField(default=list, blank=True)
+    data_as_of = models.DateField(blank=True, null=True)
+    data_status = models.CharField(max_length=24, default='draft')
+    apy_source_url = models.URLField(blank=True, default='')
+    fees_verified = models.BooleanField(default=False)
+    latitude = models.FloatField(blank=True, null=True)
+    longitude = models.FloatField(blank=True, null=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return self.name
+
+
+class NewsArticle(models.Model):
+    CATEGORY_CHOICES = [
+        ('news', 'Новости'),
+        ('analysis', 'Аналитика'),
+        ('banks', 'Банки'),
+        ('markets', 'Рынки'),
+        ('regulation', 'Регулирование'),
+        ('guides', 'Гайды'),
+    ]
+
+    title = models.CharField(max_length=240)
+    title_uz = models.CharField(max_length=240, blank=True)
+    slug = models.SlugField(max_length=260, unique=True)
+    excerpt = models.TextField(blank=True)
+    excerpt_uz = models.TextField(blank=True)
+    content = models.TextField(blank=True)
+    content_uz = models.TextField(blank=True)
+    category = models.CharField(max_length=24, choices=CATEGORY_CHOICES, default='news')
+    image_url = models.URLField(blank=True)
+    source_name = models.CharField(max_length=120, blank=True)
+    source_url = models.URLField(blank=True)
+    external_id = models.CharField(max_length=260, blank=True)
+    published_at = models.DateTimeField(default=timezone.now)
+    is_published = models.BooleanField(default=False)
+    is_featured = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ('-published_at', '-created_at')
+        indexes = [
+            models.Index(fields=('is_published', '-published_at')),
+            models.Index(fields=('category', '-published_at')),
+        ]
+
+    def __str__(self):
+        return self.title
+
+
+# Модель заявки (Кредит или Карта)
+class Application(models.Model):
+    TYPE_CHOICES = [('loan', 'Кредит'), ('card', 'Карта'), ('bank', 'Банк'), ('investment', 'Инвестиция')]
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    target_name = models.CharField(max_length=100) # Название банка или карты
+    app_type = models.CharField(max_length=10, choices=TYPE_CHOICES)
+    status = models.CharField(max_length=20, default='pending')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+# Модель Инвестиций пользователя
+class UserInvestment(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    project_name = models.CharField(max_length=100)
+    amount = models.DecimalField(max_digits=15, decimal_places=2)
+    current_value = models.DecimalField(max_digits=15, decimal_places=2) # Для графиков роста
+    roi = models.FloatField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+
+class LegalEntityProfile(models.Model):
+    STATUS_CHOICES = [
+        ('draft', 'Черновик'),
+        ('pending_review', 'На проверке'),
+        ('verified', 'Подтверждено'),
+        ('rejected', 'Отклонено'),
+    ]
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='legal_profile')
+    company_name = models.CharField(max_length=160)
+    legal_form = models.CharField(max_length=80, blank=True, default='MCHJ')
+    tin = models.CharField(max_length=20, blank=True)  # INN/STIR
+    registration_number = models.CharField(max_length=40, blank=True)
+    bank_account = models.CharField(max_length=32, blank=True)
+    director_name = models.CharField(max_length=120, blank=True)
+    director_passport = models.CharField(max_length=20, blank=True)
+    director_birth_date = models.DateField(blank=True, null=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='draft')
+    accepted_terms = models.BooleanField(default=False)
+    accepted_investment_risk = models.BooleanField(default=False)
+    company_docs = models.JSONField(default=list, blank=True)
+    myid_status = models.CharField(max_length=32, default='not_started')
+    myid_session_id = models.CharField(max_length=120, blank=True)
+    myid_payload = models.JSONField(default=dict, blank=True)
+    submitted_at = models.DateTimeField(blank=True, null=True)
+    verified_at = models.DateTimeField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.company_name} ({self.status})"
+
+
+class Startup(models.Model):
+    STAGE_CHOICES = [
+        ('idea', 'Идея'),
+        ('mvp', 'MVP'),
+        ('growth', 'Рост'),
+        ('scale', 'Масштабирование'),
+    ]
+    STATUS_CHOICES = [
+        ('draft', 'Черновик'),
+        ('active', 'Активен'),
+        ('closed', 'Закрыт'),
+    ]
+    owner = models.ForeignKey(User, on_delete=models.CASCADE, related_name='owned_startups')
+    legal_entity = models.ForeignKey(LegalEntityProfile, on_delete=models.CASCADE, related_name='startups')
+    name = models.CharField(max_length=140)
+    domain = models.CharField(max_length=40, default='startup')
+    stage = models.CharField(max_length=20, choices=STAGE_CHOICES, default='mvp')
+    funding_goal = models.DecimalField(max_digits=15, decimal_places=2)
+    min_investment = models.DecimalField(max_digits=12, decimal_places=2, default=1000)
+    amount_raised = models.DecimalField(max_digits=15, decimal_places=2, default=0)
+    roi = models.FloatField(default=20)
+    description = models.TextField()
+    contact_email = models.EmailField(blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='active')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return self.name
+
+
+class Investment(models.Model):
+    STATUS_CHOICES = [
+        ('pending_payment', 'Ожидает оплаты'),
+        ('paid', 'Оплачено'),
+        ('canceled', 'Отменено'),
+    ]
+    investor = models.ForeignKey(User, on_delete=models.CASCADE, related_name='startup_investments')
+    startup = models.ForeignKey(Startup, on_delete=models.SET_NULL, related_name='investments', null=True, blank=True)
+    order = models.ForeignKey(Order, on_delete=models.SET_NULL, related_name='investments', null=True, blank=True)
+    amount = models.DecimalField(max_digits=15, decimal_places=2)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending_payment')
+    comment = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.investor_id} -> {self.startup_id}: {self.amount}"
+
+
+class APIConfiguration(models.Model):
+    KEY_CHOICES = [
+        # Payme Merchant
+        ('PAYME_MERCHANT_ID', 'Payme Merchant ID'),
+        ('PAYME_MERCHANT_KEY', 'Payme Merchant Key'),
+        ('PAYME_PREVIOUS_MERCHANT_KEY', 'Payme Previous Merchant Key'),
+        ('PAYME_CHECKOUT_URL', 'Payme Checkout URL'),
+        ('PAYME_CALLBACK_URL', 'Payme Callback URL'),
+        ('PAYME_ACCOUNT_KEY', 'Payme Account Key'),
+        # Payme Subscribe
+        ('PAYME_SUBSCRIBE_ID', 'Payme Subscribe ID'),
+        ('PAYME_SUBSCRIBE_KEY', 'Payme Subscribe Key'),
+        ('PAYME_SUBSCRIBE_BASE_URL', 'Payme Subscribe Base URL'),
+        # Octo Money Transfer / P2P
+        ('OCTO_API_BASE_URL', 'Octo API Base URL'),
+        ('OCTO_SECRET_KEY', 'Octo Secret Key'),
+        ('OCTO_SHOP_ID', 'Octo Shop ID'),
+        ('OCTO_MERCHANT_ID', 'Octo Merchant ID'),
+        ('OCTO_P2P_ENDPOINT', 'Octo P2P Endpoint'),
+        ('OCTO_P2P_ENABLED', 'Octo P2P Enabled (true/false)'),
+        # MyID
+        ('MYID_BASE_URL', 'MyID Base URL'),
+        ('MYID_CLIENT_ID', 'MyID Client ID'),
+        ('MYID_CLIENT_SECRET', 'MyID OAuth Client Secret'),
+        ('MYID_CLIENT_HASH', 'MyID Client Hash'),
+        ('MYID_CLIENT_HASH_ID', 'MyID Client Hash ID'),
+        ('MYID_USERNAME', 'MyID Username'),
+        ('MYID_PASSWORD', 'MyID Password'),
+        ('MYID_HOSTED_URL', 'MyID Hosted URL'),
+        ('MYID_AUTHORIZATION_URL', 'MyID Authorization URL'),
+        ('MYID_REDIRECT_URI', 'MyID Redirect URI'),
+        # SMS
+        ('SMS_DEMO_MODE', 'SMS Demo Mode (true/false)'),
+        ('SMS_DEMO_CODE', 'SMS Demo Code'),
+        ('SMS_PROVIDER_URL', 'SMS Provider URL'),
+        ('SMS_PROVIDER_TOKEN', 'SMS Provider Token'),
+    ]
+
+    key = models.CharField(max_length=100, choices=KEY_CHOICES, unique=True, verbose_name="Key")
+    value = models.CharField(max_length=500, blank=True, null=True, verbose_name="Value")
+    is_active = models.BooleanField(default=True, verbose_name="Is Active")
+    description = models.TextField(blank=True, null=True, verbose_name="Description")
+
+    class Meta:
+        verbose_name = "API Configuration"
+        verbose_name_plural = "API Configurations"
+
+    def __str__(self):
+        return f"{self.key}: {'[SET]' if self.value else '[EMPTY]'}"

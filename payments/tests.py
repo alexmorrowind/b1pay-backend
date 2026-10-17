@@ -1,0 +1,953 @@
+import base64
+import os
+import time
+from urllib.parse import unquote, urlparse
+
+from django.test import TestCase, override_settings
+from django.contrib.auth.models import User
+from rest_framework.test import APIClient
+
+from .admin import reset_users_to_temporary_passwords
+from .integrations import normalize_payme_subscribe_base_url
+from .models import APIConfiguration, Bank, Card, Investment, LegalEntityProfile, NewsArticle, Order, P2PTransfer, PaymeTransaction, Startup, UserProfile
+from .views import (
+    PAYME_SANDBOX_ALIAS_TARGET_ID,
+    PaymeWebhookView,
+    build_payme_checkout_url,
+    config_group_status,
+    config_source,
+    get_payme_merchant_keys,
+    get_payme_auth_keys,
+    normalize_payme_checkout_url,
+)
+
+PAYME_ENV_KEYS = [
+    'PAYME_MERCHANT_ID',
+    'PAYME_MERCHANT_KEY',
+    'PAYME_PREVIOUS_MERCHANT_KEY',
+    'PAYME_CHECKOUT_URL',
+    'PAYME_CALLBACK_URL',
+    'PAYME_ACCOUNT_KEY',
+    'PAYME_SUBSCRIBE_ID',
+    'PAYME_SUBSCRIBE_KEY',
+    'PAYME_SUBSCRIBE_BASE_URL',
+]
+
+OCTO_ENV_KEYS = [
+    'OCTO_API_BASE_URL',
+    'OCTO_SECRET_KEY',
+    'OCTO_SHOP_ID',
+    'OCTO_MERCHANT_ID',
+    'OCTO_P2P_ENDPOINT',
+    'OCTO_P2P_ENABLED',
+]
+
+
+class ClearsPaymeEnvMixin:
+    def setUp(self):
+        super().setUp()
+        self._payme_env_originals = {key: os.environ.get(key) for key in PAYME_ENV_KEYS}
+        for key in PAYME_ENV_KEYS:
+            os.environ.pop(key, None)
+
+    def tearDown(self):
+        for key, value in self._payme_env_originals.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        super().tearDown()
+
+
+class ClearsOctoEnvMixin:
+    def setUp(self):
+        super().setUp()
+        self._octo_env_originals = {key: os.environ.get(key) for key in OCTO_ENV_KEYS}
+        for key in OCTO_ENV_KEYS:
+            os.environ.pop(key, None)
+
+    def tearDown(self):
+        for key, value in self._octo_env_originals.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        super().tearDown()
+
+
+class BankApiTests(TestCase):
+    def test_health_endpoint(self):
+        response = APIClient().get('/api/health/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, {'status': 'ok'})
+
+    def test_bank_list_seeds_defaults_when_database_is_empty(self):
+        client = APIClient()
+
+        response = client.get('/api/banks/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 10)
+        self.assertIn('minDeposit', response.data[0])
+        self.assertIn('features', response.data[0])
+        self.assertIn('officialSources', response.data[0])
+        self.assertIn('latitude', response.data[0])
+        self.assertIn('longitude', response.data[0])
+        self.assertTrue(all(bank['isCatalog'] for bank in response.data))
+        self.assertTrue(all(bank['latitude'] is not None for bank in response.data))
+        self.assertTrue(all(bank['longitude'] is not None for bank in response.data))
+
+    def test_bank_detail_returns_full_profile(self):
+        list_response = APIClient().get('/api/banks/')
+        bank_id = list_response.data[0]['id']
+
+        response = APIClient().get(f'/api/banks/{bank_id}/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['id'], bank_id)
+        self.assertTrue(response.data['legal_name'])
+        self.assertTrue(response.data['license_number'])
+        self.assertTrue(response.data['website_url'])
+        self.assertTrue(response.data['products'])
+        self.assertTrue(response.data['services'])
+
+    def test_non_catalog_bank_is_hidden(self):
+        Bank.objects.create(
+            name='Temporary bank',
+            abbr='TMP',
+            logo_url='',
+            min_deposit=0,
+            is_catalog=False,
+        )
+
+        response = APIClient().get('/api/banks/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn('TMP', [bank['abbr'] for bank in response.data])
+
+
+class NewsApiTests(TestCase):
+    def test_unpublished_news_is_hidden(self):
+        NewsArticle.objects.create(
+            title='Hidden article',
+            slug='hidden-article',
+            is_published=False,
+        )
+
+        response = APIClient().get('/api/news/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, [])
+
+    def test_published_news_returns_localized_fields(self):
+        article = NewsArticle.objects.create(
+            title='Новости банка',
+            title_uz='Bank yangiliklari',
+            slug='bank-yangiliklari',
+            excerpt='Короткое описание',
+            excerpt_uz='Qisqa tavsif',
+            category='banks',
+            source_name='B1',
+            is_published=True,
+        )
+
+        response = APIClient().get('/api/news/?lang=uz')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data[0]['id'], article.id)
+        self.assertEqual(response.data[0]['display_title'], 'Bank yangiliklari')
+        self.assertEqual(response.data[0]['display_excerpt'], 'Qisqa tavsif')
+
+
+class StartupPublicApiTests(TestCase):
+    def setUp(self):
+        self.owner = User.objects.create_user(
+            username='startup-owner@example.com',
+            email='startup-owner@example.com',
+            password='Testpass123',
+        )
+        self.legal_profile = LegalEntityProfile.objects.create(
+            user=self.owner,
+            company_name='B1 Startup LLC',
+            status='verified',
+            accepted_terms=True,
+            accepted_investment_risk=True,
+        )
+        self.active_startup = Startup.objects.create(
+            owner=self.owner,
+            legal_entity=self.legal_profile,
+            name='Public Startup',
+            domain='fintech',
+            stage='mvp',
+            funding_goal='1000000.00',
+            min_investment='100000.00',
+            amount_raised='250000.00',
+            roi=20,
+            description='A public startup profile.',
+            contact_email='private@example.com',
+            status='active',
+        )
+        self.draft_startup = Startup.objects.create(
+            owner=self.owner,
+            legal_entity=self.legal_profile,
+            name='Draft Startup',
+            domain='fintech',
+            stage='idea',
+            funding_goal='1000000.00',
+            min_investment='100000.00',
+            description='A draft startup profile.',
+            contact_email='draft@example.com',
+            status='draft',
+        )
+
+    def test_public_catalog_hides_private_fields_and_drafts(self):
+        response = APIClient().get('/api/startups/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['id'], self.active_startup.id)
+        self.assertNotIn('contact_email', response.data[0])
+        self.assertNotIn('owner_email', response.data[0])
+
+    def test_public_startup_detail_hides_draft(self):
+        client = APIClient()
+
+        active_response = client.get(f'/api/startups/{self.active_startup.id}/')
+        draft_response = client.get(f'/api/startups/{self.draft_startup.id}/')
+
+        self.assertEqual(active_response.status_code, 200)
+        self.assertNotIn('contact_email', active_response.data)
+        self.assertEqual(draft_response.status_code, 404)
+
+    def test_anonymous_startup_create_is_rejected(self):
+        response = APIClient().post('/api/startups/', {
+            'name': 'Anonymous startup',
+            'domain': 'fintech',
+            'stage': 'mvp',
+            'funding_goal': 100000,
+            'min_investment': 10000,
+            'roi': 20,
+            'description': 'Must not be created.',
+        }, format='json')
+
+        self.assertEqual(response.status_code, 401)
+
+
+class RegistrationApiTests(TestCase):
+    def test_register_defaults_to_standard_registration_without_payme(self):
+        client = APIClient()
+
+        response = client.post('/api/auth/register/', {
+            'email': 'standard-user@example.com',
+            'password': 'demo1234',
+            'phone': '+998901234568',
+        }, format='json')
+
+        self.assertEqual(response.status_code, 201)
+        self.assertNotIn('payme_checkout_url', response.data)
+
+    def test_register_respects_explicit_payme_connect_false(self):
+        client = APIClient()
+
+        response = client.post('/api/auth/register/', {
+            'email': 'mobile-user@example.com',
+            'password': 'demo1234',
+            'phone': '+998901234567',
+            'payme_connect': False,
+        }, format='json')
+
+        self.assertEqual(response.status_code, 201)
+        self.assertNotIn('payme_checkout_url', response.data)
+
+
+class UserAdminPasswordResetTests(TestCase):
+    def test_reset_users_to_temporary_passwords_changes_password(self):
+        user = User.objects.create_user(
+            username='forgot-password-user',
+            email='forgot-password@example.com',
+            password='Oldpass123',
+        )
+
+        reset_rows = reset_users_to_temporary_passwords(User.objects.filter(pk=user.pk))
+
+        self.assertEqual(len(reset_rows), 1)
+        username, temporary_password = reset_rows[0]
+        self.assertEqual(username, 'forgot-password-user')
+        self.assertEqual(len(temporary_password), 14)
+
+        user.refresh_from_db()
+        self.assertTrue(user.check_password(temporary_password))
+        self.assertFalse(user.check_password('Oldpass123'))
+        self.assertNotEqual(user.password, temporary_password)
+
+
+class OctoP2PTransferApiTests(ClearsOctoEnvMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.user = User.objects.create_user(
+            username='p2p-user@example.com',
+            email='p2p-user@example.com',
+            password='Testpass123',
+        )
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+
+    def test_transfer_is_saved_as_not_connected_without_p2p_contract(self):
+        card = Card.objects.create(
+            user=self.user,
+            number='8600123412345678',
+            expiry='12/28',
+            name='Kapitalbank test',
+        )
+
+        response = self.client.post('/api/octo/p2p/transfers/', {
+            'source_card_id': card.id,
+            'recipient': '8600111122223333',
+            'amount': 50000,
+            'currency': 'UZS',
+        }, format='json')
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.data['status'], 'provider_not_connected')
+        self.assertEqual(response.data['source_card_mask'], '860012******5678')
+        self.assertEqual(response.data['recipient_mask'], '860011******3333')
+        self.assertNotIn('recipient', response.data)
+        self.assertEqual(P2PTransfer.objects.count(), 1)
+
+    def test_transfer_requires_authentication(self):
+        client = APIClient()
+
+        response = client.post('/api/octo/p2p/transfers/', {
+            'recipient': '8600111122223333',
+            'amount': 50000,
+            'currency': 'UZS',
+        }, format='json')
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_transfer_rejects_invalid_recipient(self):
+        response = self.client.post('/api/octo/p2p/transfers/', {
+            'recipient': 'abc',
+            'amount': 50000,
+            'currency': 'UZS',
+        }, format='json')
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('recipient', response.data)
+
+
+class PaymeCheckoutUrlTests(TestCase):
+    def test_payme_sandbox_base_url_is_normalized_to_checkout_host(self):
+        url = normalize_payme_checkout_url('https://test.paycom.uz')
+
+        self.assertEqual(url, 'https://checkout.test.paycom.uz')
+
+    def test_payme_production_base_url_is_normalized_to_checkout_host(self):
+        url = normalize_payme_checkout_url('https://paycom.uz')
+
+        self.assertEqual(url, 'https://checkout.paycom.uz')
+
+    def test_checkout_api_suffix_is_removed_for_checkout_redirects(self):
+        url = normalize_payme_checkout_url('https://checkout.test.paycom.uz/api')
+
+        self.assertEqual(url, 'https://checkout.test.paycom.uz')
+
+    @override_settings()
+    def test_checkout_payload_uses_single_configured_account_key(self):
+        order = Order.objects.create(amount='1000.00', purpose='card_order')
+
+        url = build_payme_checkout_url(order)
+        encoded_payload = unquote(urlparse(url).path.lstrip('/'))
+        payload = base64.b64decode(encoded_payload).decode('utf-8')
+
+        self.assertIn(f"ac.Bpay={order.id}", payload)
+        self.assertNotIn("ac.order_id=", payload)
+        self.assertEqual(payload.count(';ac.'), 1)
+
+
+class PaymeSubscribeUrlTests(TestCase):
+    def test_subscribe_sandbox_base_url_is_normalized_to_checkout_api(self):
+        url = normalize_payme_subscribe_base_url('https://test.paycom.uz/api')
+
+        self.assertEqual(url, 'https://checkout.test.paycom.uz/api')
+
+    def test_subscribe_base_url_adds_api_path_when_missing(self):
+        url = normalize_payme_subscribe_base_url('checkout.test.paycom.uz')
+
+        self.assertEqual(url, 'https://checkout.test.paycom.uz/api')
+
+
+class PaymeWebhookValidationTests(ClearsPaymeEnvMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.view = PaymeWebhookView()
+
+    def test_check_perform_transaction_rejects_invalid_amount_format(self):
+        response = self.view._check_perform_transaction({
+            'amount': 'not-a-number',
+            'account': {'Bpay': 'missing'},
+        }, 1)
+
+        self.assertEqual(response.data['error']['code'], -31001)
+
+    def test_create_transaction_rejects_invalid_amount_format(self):
+        response = self.view._create_transaction({
+            'id': 'payme-test-id',
+            'amount': 'not-a-number',
+            'account': {'Bpay': 'missing'},
+            'time': 1,
+        }, 2)
+
+        self.assertEqual(response.data['error']['code'], -31001)
+
+    def test_check_perform_transaction_rejects_wrong_order_amount(self):
+        order = Order.objects.create(amount='1000.00', purpose='card_order')
+        response = self.view._check_perform_transaction({
+            'amount': 100001,
+            'account': {'Bpay': str(order.id)},
+        }, 3)
+
+        self.assertEqual(response.data['error']['code'], -31001)
+
+    def test_check_perform_transaction_accepts_payme_sandbox_alias(self):
+        Order.objects.create(amount='1000.00', purpose='card_order')
+
+        response = self.view._check_perform_transaction({
+            'amount': 100000,
+            'account': {'Bpay': 'Bpay'},
+        }, 4)
+
+        self.assertEqual(response.data['result']['allow'], True)
+
+    def test_check_perform_transaction_rejects_wrong_amount_for_sandbox_alias(self):
+        Order.objects.create(amount='1000.00', purpose='card_order')
+
+        response = self.view._check_perform_transaction({
+            'amount': 50000,
+            'account': {'Bpay': 'Bpay'},
+        }, 5)
+
+        self.assertEqual(response.data['error']['code'], -31001)
+
+    def test_create_transaction_uses_payme_sandbox_alias(self):
+        Order.objects.create(amount='1000.00', purpose='card_order')
+
+        response = self.view._create_transaction({
+            'id': 'payme-test-id',
+            'amount': 100000,
+            'account': {'Bpay': 'Bpay'},
+            'time': 123456,
+        }, 6)
+
+        self.assertEqual(response.data['result']['state'], 1)
+
+    def test_sandbox_alias_reuses_isolated_order_across_multiple_runs(self):
+        create_time = int(time.time() * 1000)
+        first_check = self.view._check_perform_transaction({
+            'amount': 100000,
+            'account': {'Bpay': 'Bpay'},
+        }, 6)
+        self.assertEqual(first_check.data['result']['allow'], True)
+        self.assertEqual(
+            Order.objects.filter(target_id=PAYME_SANDBOX_ALIAS_TARGET_ID, status='pending').count(),
+            1,
+        )
+
+        first_create = self.view._create_transaction({
+            'id': 'payme-sandbox-repeat-1',
+            'amount': 100000,
+            'account': {'Bpay': 'Bpay'},
+            'time': create_time,
+        }, 61)
+        self.assertEqual(first_create.data['result']['state'], 1)
+
+        first_perform = self.view._perform_transaction({'id': 'payme-sandbox-repeat-1'}, 62)
+        self.assertEqual(first_perform.data['result']['state'], 2)
+        self.assertEqual(
+            Order.objects.filter(target_id=PAYME_SANDBOX_ALIAS_TARGET_ID, status='pending').count(),
+            0,
+        )
+
+        second_check = self.view._check_perform_transaction({
+            'amount': 100000,
+            'account': {'Bpay': 'Bpay'},
+        }, 63)
+        self.assertEqual(second_check.data['result']['allow'], True)
+        self.assertEqual(
+            Order.objects.filter(target_id=PAYME_SANDBOX_ALIAS_TARGET_ID, status='pending').count(),
+            1,
+        )
+
+    def test_sandbox_alias_does_not_consume_real_pending_orders(self):
+        real_order = Order.objects.create(amount='1000.00', purpose='card_order')
+
+        response = self.view._check_perform_transaction({
+            'amount': 100000,
+            'account': {'Bpay': 'Bpay'},
+        }, 64)
+
+        real_order.refresh_from_db()
+
+        self.assertEqual(response.data['result']['allow'], True)
+        self.assertEqual(real_order.status, 'pending')
+        self.assertFalse(
+            Order.objects.filter(target_id=PAYME_SANDBOX_ALIAS_TARGET_ID, id=real_order.id).exists()
+        )
+
+    def test_change_password_updates_admin_configuration(self):
+        response = self.view._change_password({'password': 'new-payme-secret'}, 7)
+
+        self.assertEqual(response.data['result']['success'], True)
+        self.assertEqual(
+            APIConfiguration.objects.get(key='PAYME_MERCHANT_KEY').value,
+            'new-payme-secret',
+        )
+
+    def test_change_password_rejects_current_password(self):
+        APIConfiguration.objects.update_or_create(
+            key='PAYME_MERCHANT_KEY',
+            defaults={'value': 'current-payme-secret', 'is_active': True},
+        )
+
+        response = self.view._change_password({'password': 'current-payme-secret'}, 71)
+
+        self.assertEqual(response.data['error']['code'], -32504)
+        self.assertEqual(
+            APIConfiguration.objects.get(key='PAYME_MERCHANT_KEY').value,
+            'current-payme-secret',
+        )
+
+    def test_merchant_keys_include_admin_and_env_values(self):
+        APIConfiguration.objects.update_or_create(
+            key='PAYME_MERCHANT_KEY',
+            defaults={'value': 'admin-secret', 'is_active': True},
+        )
+
+        original = os.environ.get('PAYME_MERCHANT_KEY')
+        os.environ['PAYME_MERCHANT_KEY'] = 'env-secret'
+        try:
+            self.assertIn('admin-secret', get_payme_merchant_keys())
+            self.assertIn('env-secret', get_payme_merchant_keys())
+        finally:
+            if original is None:
+                os.environ.pop('PAYME_MERCHANT_KEY', None)
+            else:
+                os.environ['PAYME_MERCHANT_KEY'] = original
+
+    def test_payme_auth_key_prefers_environment_over_admin(self):
+        APIConfiguration.objects.update_or_create(
+            key='PAYME_MERCHANT_KEY',
+            defaults={'value': 'old-admin-secret', 'is_active': True},
+        )
+
+        original = os.environ.get('PAYME_MERCHANT_KEY')
+        os.environ['PAYME_MERCHANT_KEY'] = 'render-env-secret'
+        try:
+            self.assertEqual(get_payme_auth_keys(), ['render-env-secret'])
+        finally:
+            if original is None:
+                os.environ.pop('PAYME_MERCHANT_KEY', None)
+            else:
+                os.environ['PAYME_MERCHANT_KEY'] = original
+
+    def test_config_source_prefers_environment_over_admin(self):
+        APIConfiguration.objects.update_or_create(
+            key='PAYME_CHECKOUT_URL',
+            defaults={'value': 'https://test.paycom.uz', 'is_active': True},
+        )
+
+        original = os.environ.get('PAYME_CHECKOUT_URL')
+        os.environ['PAYME_CHECKOUT_URL'] = 'https://checkout.paycom.uz'
+        try:
+            self.assertEqual(config_source('PAYME_CHECKOUT_URL'), ('env', 'https://checkout.paycom.uz'))
+        finally:
+            if original is None:
+                os.environ.pop('PAYME_CHECKOUT_URL', None)
+            else:
+                os.environ['PAYME_CHECKOUT_URL'] = original
+
+    def test_checkout_status_coerces_test_url_to_production_by_default(self):
+        original_url = os.environ.get('PAYME_CHECKOUT_URL')
+        original_mode = os.environ.get('PAYME_TEST_MODE')
+        os.environ['PAYME_CHECKOUT_URL'] = 'https://test.paycom.uz'
+        os.environ.pop('PAYME_TEST_MODE', None)
+        try:
+            self.assertEqual(config_source('PAYME_CHECKOUT_URL'), ('env', 'https://checkout.paycom.uz'))
+        finally:
+            if original_url is None:
+                os.environ.pop('PAYME_CHECKOUT_URL', None)
+            else:
+                os.environ['PAYME_CHECKOUT_URL'] = original_url
+            if original_mode is None:
+                os.environ.pop('PAYME_TEST_MODE', None)
+            else:
+                os.environ['PAYME_TEST_MODE'] = original_mode
+
+    def test_subscribe_status_can_use_merchant_environment_aliases(self):
+        originals = {
+            key: os.environ.get(key)
+            for key in [
+                'PAYME_MERCHANT_ID',
+                'PAYME_MERCHANT_KEY',
+                'PAYME_SUBSCRIBE_ID',
+                'PAYME_SUBSCRIBE_KEY',
+            ]
+        }
+        os.environ['PAYME_MERCHANT_ID'] = 'merchant-id'
+        os.environ['PAYME_MERCHANT_KEY'] = 'merchant-key'
+        os.environ.pop('PAYME_SUBSCRIBE_ID', None)
+        os.environ.pop('PAYME_SUBSCRIBE_KEY', None)
+        APIConfiguration.objects.update_or_create(
+            key='PAYME_SUBSCRIBE_BASE_URL',
+            defaults={'value': '', 'is_active': True},
+        )
+        try:
+            status = config_group_status([
+                'PAYME_SUBSCRIBE_ID',
+                'PAYME_SUBSCRIBE_KEY',
+                'PAYME_SUBSCRIBE_BASE_URL',
+            ])
+            self.assertTrue(status['configured'])
+            self.assertEqual(status['items']['PAYME_SUBSCRIBE_ID']['source'], 'env:PAYME_MERCHANT_ID')
+            self.assertEqual(status['items']['PAYME_SUBSCRIBE_KEY']['source'], 'env:PAYME_MERCHANT_KEY')
+            self.assertEqual(status['items']['PAYME_SUBSCRIBE_BASE_URL']['source'], 'default')
+        finally:
+            for key, value in originals.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_check_transaction_always_includes_reason_field(self):
+        order = Order.objects.create(amount='1000.00', purpose='card_order')
+        tx = PaymeTransaction.objects.create(
+            payme_id='tx-1',
+            order=order,
+            amount=100000,
+            state=1,
+            create_time=int(time.time() * 1000),
+        )
+
+        result = self.view._check_transaction_result(tx)
+
+        self.assertIn('reason', result)
+        self.assertIsNone(result['reason'])
+
+    def test_get_statement_keeps_sandbox_alias_account_value(self):
+        create_time = int(time.time() * 1000)
+        create = self.view._create_transaction({
+            'id': 'payme-statement-alias',
+            'amount': 100000,
+            'account': {'Bpay': 'Bpay'},
+            'time': create_time,
+        }, 72)
+        self.assertEqual(create.data['result']['state'], 1)
+
+        statement = self.view._get_statement({
+            'from': create_time - 1,
+            'to': create_time + 1,
+        }, 73)
+
+        self.assertEqual(statement.data['result']['transactions'][0]['account'], {'Bpay': 'Bpay'})
+
+    def test_get_statement_returns_all_transactions_in_range(self):
+        order_a = Order.objects.create(amount='1000.00', purpose='card_order')
+        order_b = Order.objects.create(amount='1000.00', purpose='investment')
+        tx_a = PaymeTransaction.objects.create(
+            payme_id='payme-statement-1',
+            order=order_a,
+            amount=100000,
+            state=2,
+            create_time=1000,
+            perform_time=2000,
+        )
+        tx_b = PaymeTransaction.objects.create(
+            payme_id='payme-statement-2',
+            order=order_b,
+            amount=100000,
+            state=1,
+            create_time=3000,
+        )
+        PaymeTransaction.objects.create(
+            payme_id='payme-statement-outside',
+            order=order_b,
+            amount=100000,
+            state=1,
+            create_time=5000,
+        )
+
+        statement = self.view._get_statement({'from': 999, 'to': 4000}, 74)
+        tx_ids = [item['id'] for item in statement.data['result']['transactions']]
+
+        self.assertEqual(tx_ids, [tx_a.payme_id, tx_b.payme_id])
+
+    def test_perform_transaction_does_not_duplicate_payme_card_or_double_add_investment(self):
+        user = User.objects.create_user(username='payme-double', password='Testpass123')
+        UserProfile.objects.create(user=user, myid_status='verified')
+        order = Order.objects.create(user=user, amount='1000.00', purpose='card_order')
+        startup_owner = User.objects.create_user(username='startup-owner', password='Testpass123')
+        legal_entity = LegalEntityProfile.objects.create(
+            user=startup_owner,
+            company_name='Test Startup LLC',
+            legal_form='MCHJ',
+            accepted_terms=True,
+            accepted_investment_risk=True,
+            status='verified',
+            myid_status='verified',
+        )
+        startup = Startup.objects.create(
+            owner=startup_owner,
+            legal_entity=legal_entity,
+            name='Test Startup',
+            domain='startup',
+            stage='mvp',
+            funding_goal=1000,
+            min_investment=1000,
+            amount_raised=0,
+            roi=20,
+            description='Demo startup',
+            contact_email='demo@example.com',
+        )
+        investment_order = Order.objects.create(user=user, amount='1000.00', purpose='investment', target_id=str(startup.id))
+        Investment.objects.create(investor=user, startup=startup, order=investment_order, amount=1000)
+        now_ms = int(time.time() * 1000)
+        PaymeTransaction.objects.create(
+            payme_id='payme-card-perform',
+            order=order,
+            amount=100000,
+            state=1,
+            create_time=now_ms,
+        )
+        PaymeTransaction.objects.create(
+            payme_id='payme-invest-perform',
+            order=investment_order,
+            amount=100000,
+            state=1,
+            create_time=now_ms + 1,
+        )
+
+        first = self.view._perform_transaction({'id': 'payme-card-perform'}, 75)
+        second = self.view._perform_transaction({'id': 'payme-card-perform'}, 76)
+        invest = self.view._perform_transaction({'id': 'payme-invest-perform'}, 77)
+
+        self.assertEqual(first.data['result']['state'], 2)
+        self.assertEqual(second.data['result']['state'], 2)
+        self.assertEqual(invest.data['result']['state'], 2)
+        self.assertEqual(Card.objects.filter(user=user, provider='payme', payme_verified=True).count(), 1)
+        self.assertEqual(Investment.objects.get(order=investment_order).status, 'paid')
+        startup.refresh_from_db()
+        self.assertEqual(float(startup.amount_raised), 1000.0)
+
+    def test_create_transaction_rejects_existing_transaction_for_different_order(self):
+        order_a = Order.objects.create(amount='1000.00', purpose='card_order')
+        order_b = Order.objects.create(amount='1000.00', purpose='card_order')
+        PaymeTransaction.objects.create(
+            payme_id='payme-test-id',
+            order=order_a,
+            amount=100000,
+            state=1,
+            create_time=123456,
+        )
+
+        response = self.view._create_transaction({
+            'id': 'payme-test-id',
+            'amount': 100000,
+            'account': {'Bpay': str(order_b.id)},
+            'time': 123456,
+        }, 8)
+
+        self.assertEqual(response.data['error']['code'], -31008)
+
+    def test_create_transaction_rejects_new_transaction_when_order_is_busy(self):
+        order = Order.objects.create(amount='1000.00', purpose='card_order')
+        PaymeTransaction.objects.create(
+            payme_id='payme-active-transaction',
+            order=order,
+            amount=100000,
+            state=1,
+            create_time=int(time.time() * 1000),
+        )
+
+        response = self.view._create_transaction({
+            'id': 'payme-second-transaction',
+            'amount': 100000,
+            'account': {'Bpay': str(order.id)},
+            'time': int(time.time() * 1000),
+        }, 78)
+
+        self.assertEqual(response.data['error']['code'], -31099)
+        self.assertEqual(response.data['error']['data'], 'Bpay')
+
+    def test_perform_transaction_times_out_old_transaction(self):
+        order = Order.objects.create(amount='1000.00', purpose='card_order')
+        tx = PaymeTransaction.objects.create(
+            payme_id='payme-timeout-id',
+            order=order,
+            amount=100000,
+            state=1,
+            create_time=int(time.time() * 1000) - (13 * 60 * 60 * 1000),
+        )
+
+        response = self.view._perform_transaction({'id': tx.payme_id}, 9)
+
+        tx.refresh_from_db()
+        order.refresh_from_db()
+
+        self.assertEqual(response.data['error']['code'], -31008)
+        self.assertEqual(tx.state, -1)
+        self.assertEqual(tx.reason, 4)
+        self.assertEqual(order.status, 'canceled')
+
+
+class PaymeMerchantEndpointTests(ClearsPaymeEnvMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        APIConfiguration.objects.update_or_create(
+            key='PAYME_MERCHANT_KEY',
+            defaults={'value': 'test_merchant_secret_key', 'is_active': True},
+        )
+        self.client = APIClient()
+        self.user = User.objects.create_user(
+            username='payme-tester',
+            email='payme-tester@example.com',
+            password='Testpass123',
+        )
+        self.client.force_authenticate(user=self.user)
+        self.auth = self._auth_header('test_merchant_secret_key')
+
+    def _auth_header(self, password):
+        encoded = base64.b64encode(f"Paycom:{password}".encode()).decode()
+        return f"Basic {encoded}"
+
+    def _rpc(self, method, params=None, request_id=1, auth=None):
+        return self.client.post(
+            '/api/payme/',
+            {
+                'jsonrpc': '2.0',
+                'id': request_id,
+                'method': method,
+                'params': params or {},
+            },
+            format='json',
+            HTTP_AUTHORIZATION=auth or self.auth,
+        )
+
+    def test_payme_endpoint_completes_main_transaction_lifecycle(self):
+        order = Order.objects.create(amount='1000.00', purpose='card_order')
+        account = {'Bpay': str(order.id)}
+        payme_id = 'payme-endpoint-test-id'
+        create_time = int(time.time() * 1000)
+
+        check = self._rpc('CheckPerformTransaction', {'amount': 100000, 'account': account}, 1)
+        self.assertEqual(check.status_code, 200)
+        self.assertEqual(check.data['result']['allow'], True)
+
+        create = self._rpc('CreateTransaction', {
+            'id': payme_id,
+            'amount': 100000,
+            'account': account,
+            'time': create_time,
+        }, 2)
+        self.assertEqual(create.status_code, 200)
+        self.assertEqual(create.data['result']['state'], 1)
+        self.assertEqual(create.data['result']['create_time'], create_time)
+
+        before_perform = self._rpc('CheckTransaction', {'id': payme_id}, 3)
+        self.assertEqual(before_perform.status_code, 200)
+        self.assertEqual(before_perform.data['result']['state'], 1)
+        self.assertIn('reason', before_perform.data['result'])
+        self.assertIsNone(before_perform.data['result']['reason'])
+
+        perform = self._rpc('PerformTransaction', {'id': payme_id}, 4)
+        self.assertEqual(perform.status_code, 200)
+        self.assertEqual(perform.data['result']['state'], 2)
+
+        statement = self._rpc('GetStatement', {'from': create_time - 1, 'to': int(time.time() * 1000) + 1000}, 5)
+        self.assertEqual(statement.status_code, 200)
+        self.assertEqual(statement.data['result']['transactions'][0]['id'], payme_id)
+
+    def test_payme_endpoint_returns_http_200_for_payme_errors(self):
+        auth_error = self.client.post(
+            '/api/payme/',
+            {'jsonrpc': '2.0', 'id': 10, 'method': 'CheckPerformTransaction', 'params': {}},
+            format='json',
+        )
+        self.assertEqual(auth_error.status_code, 200)
+        self.assertEqual(auth_error.data['error']['code'], -32504)
+
+        missing_order = self._rpc('CheckPerformTransaction', {
+            'amount': 100000,
+            'account': {'Bpay': '999999'},
+        }, 11)
+        self.assertEqual(missing_order.status_code, 200)
+        self.assertEqual(missing_order.data['error']['code'], -31050)
+        self.assertEqual(missing_order.data['error']['data'], 'Bpay')
+
+    def test_change_password_rotates_endpoint_authorization(self):
+        change = self._rpc(
+            'ChangePassword',
+            {'password': 'rotated-payme-secret'},
+            20,
+            auth=self._auth_header('test_merchant_secret_key'),
+        )
+        self.assertEqual(change.status_code, 200)
+        self.assertEqual(change.data['result']['success'], True)
+
+        old_auth_create = self._rpc(
+            'CreateTransaction',
+            {
+                'id': 'payme-old-auth-create',
+                'amount': 100000,
+                'account': {'Bpay': 'Bpay'},
+                'time': int(time.time() * 1000),
+            },
+            21,
+            auth=self._auth_header('test_merchant_secret_key'),
+        )
+        self.assertEqual(old_auth_create.status_code, 200)
+        self.assertEqual(old_auth_create.data['error']['code'], -32504)
+
+        old_auth_change = self._rpc(
+            'ChangePassword',
+            {'password': 'another-rotated-payme-secret'},
+            23,
+            auth=self._auth_header('test_merchant_secret_key'),
+        )
+        self.assertEqual(old_auth_change.status_code, 200)
+        self.assertEqual(old_auth_change.data['error']['code'], -32504)
+
+        new_auth_create = self._rpc(
+            'CreateTransaction',
+            {
+                'id': 'payme-new-auth-create',
+                'amount': 100000,
+                'account': {'Bpay': 'Bpay'},
+                'time': int(time.time() * 1000),
+            },
+            22,
+            auth=self._auth_header('rotated-payme-secret'),
+        )
+        self.assertEqual(new_auth_create.status_code, 200)
+        self.assertEqual(new_auth_create.data['result']['state'], 1)
+
+    def test_payme_order_amount_is_limited_on_backend(self):
+        low = self.client.post('/api/payme/create-order/', {
+            'amount': 999,
+            'purpose': 'card_order',
+        }, format='json')
+        self.assertEqual(low.status_code, 400)
+        self.assertIn('min_amount', low.data)
+
+        high = self.client.post('/api/payme/create-order/', {
+            'amount': 10000001,
+            'purpose': 'card_order',
+        }, format='json')
+        self.assertEqual(high.status_code, 400)
+        self.assertIn('max_amount', high.data)
+
+        ok = self.client.post('/api/payme/create-order/', {
+            'amount': 1000,
+            'purpose': 'card_order',
+        }, format='json')
+        self.assertEqual(ok.status_code, 201)
