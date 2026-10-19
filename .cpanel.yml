@@ -1,13 +1,15 @@
 ---
 deployment:
   tasks:
-    # Copy all files to home directory app
-    - /bin/cp -R * $HOME/b1pay_backend/ 2>/dev/null || true
-    # Install dependencies if requirements changed
-    - /bin/bash -c "source $HOME/virtualenv/b1pay_backend/3.13/bin/activate && pip install -r $HOME/b1pay_backend/requirements.txt --quiet"
-    # Run migrations
-    - /bin/bash -c "source $HOME/virtualenv/b1pay_backend/3.13/bin/activate && cd $HOME/b1pay_backend && python manage.py migrate --noinput"
-    # Collect static files
-    - /bin/bash -c "source $HOME/virtualenv/b1pay_backend/3.13/bin/activate && cd $HOME/b1pay_backend && python manage.py collectstatic --noinput"
-    # Restart the application
-    - mkdir -p $HOME/b1pay_backend/tmp && touch $HOME/b1pay_backend/tmp/restart.txt
+    - export APP=$HOME/b1pay_backend
+    - export PY=$HOME/virtualenv/b1pay_backend/3.13/bin/python
+    - mkdir -p $APP $APP/public $APP/tmp
+    - /bin/cp -R . $APP/ 2>/dev/null || true
+    - grep -q 'DJANGO_ALLOWED_HOSTS' $APP/.env 2>/dev/null || echo 'DJANGO_ALLOWED_HOSTS=api.b1pay.uz,localhost,127.0.0.1' >> $APP/.env
+    - grep -q 'CORS_ALLOWED_ORIGINS' $APP/.env 2>/dev/null || echo 'CORS_ALLOWED_ORIGINS=https://b1pay.uz' >> $APP/.env
+    - grep -q 'DJANGO_DEBUG' $APP/.env 2>/dev/null || echo 'DJANGO_DEBUG=false' >> $APP/.env
+    - /bin/bash -c "source $HOME/virtualenv/b1pay_backend/3.13/bin/activate && pip install -r $APP/requirements.txt --quiet"
+    - /bin/bash -c "source $HOME/virtualenv/b1pay_backend/3.13/bin/activate && cd $APP && python manage.py migrate --noinput"
+    - /bin/bash -c "source $HOME/virtualenv/b1pay_backend/3.13/bin/activate && cd $APP && python manage.py collectstatic --noinput"
+    - /bin/bash -c "source $HOME/virtualenv/b1pay_backend/3.13/bin/activate && cd $APP && python manage.py ensure_superuser" || true
+    - touch $APP/tmp/restart.txt
